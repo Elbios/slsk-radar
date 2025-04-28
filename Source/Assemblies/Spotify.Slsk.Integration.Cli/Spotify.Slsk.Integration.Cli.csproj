@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>spotseek</AssemblyName>
     <InformationalVersion>1.5.5</InformationalVersion>
   </PropertyGroup>
