@@ -200,76 +200,130 @@ namespace Spotify.Slsk.Integration.Services.SoulSeek
             }
         }
 
-        private static async Task<SearchResponse?> SelectSearchResponse(SoulseekClient client, IEnumerable<SearchResponse> responses, SoulseekOptions options)
-        {
-            //filter for responses with quality files
-            if (options.AllowFlac)
-            {
-                responses = responses.Where(response => response.Files.Any(file => IsValidMp3(file) || IsValidFlac(file)));
-            }
-            else
-            {
-                responses = responses.Where(response => response.Files.Any(file => IsValidMp3(file)));
-            }
+		// Source/Assemblies/Spotify.Slsk.Integration/Services/SoulSeek/SoulseekService.cs
+		private static async Task<SearchResponse?> SelectSearchResponse(SoulseekClient client, IEnumerable<SearchResponse> responses, SoulseekOptions options)
+		{
+			// Define the file validation predicate based on options
+			Func<Soulseek.File, bool> fileValidator;
+			if (options.AllowFlac)
+			{
+				fileValidator = file => IsValidMp3(file) || IsValidFlac(file);
+			}
+			else
+			{
+				fileValidator = IsValidMp3;
+			}
 
-            //filter for queues and upload slots
-            List<SearchResponse> filteredResponses = new();
-            foreach (SearchResponse response in responses)
-            {
-                try
-                {
-                    UserInfo userInfo = await client.GetUserInfoAsync(response.Username);
-                    if (userInfo.QueueLength < 5 && userInfo.HasFreeUploadSlot)
-                    {
-                        filteredResponses.Add(response);
-                    }
-                }
-                catch (Exception) { }
-            }
+			// Filter responses that contain at least one valid file according to the validator
+			// The fix in IsValidMp3/IsValidFlac should prevent Nullable errors here.
+			var responsesWithValidFiles = responses.Where(response => response.Files.Any(fileValidator));
 
-            return filteredResponses.FirstOrDefault();
-        }
 
-        private static bool IsValidMp3(Soulseek.File file)
-        {
-            const int minimalBitRate = 320;
-            return file != null
-                && file.BitRate != null
-                && file.BitRate >= minimalBitRate
-                && file.Size * 8 / file.Length / 1000 >= minimalBitRate //recalculate bitrate
-                && file.Filename.ToUpper().EndsWith(Mp3Extension)
-                && (file.Extension.ToUpper() == Mp3Extension || string.IsNullOrEmpty(file.Extension));
-        }
+			// Further filter based on user info (queue length, free slots)
+			List<SearchResponse> filteredResponses = new();
+			foreach (SearchResponse response in responsesWithValidFiles) // Iterate through responses already known to have a potentially valid file
+			{
+				try
+				{
+					// UserInfo check might be slow or fail, handle gracefully
+					UserInfo userInfo = await client.GetUserInfoAsync(response.Username);
+					// Use the user-modified queue length check (500)
+					if (userInfo.QueueLength < 500 && userInfo.HasFreeUploadSlot)
+					{
+						filteredResponses.Add(response);
+					}
+					else
+					{
+						 // Optional: Log why a user was skipped
+						 // Log.Debug($"Skipping user {response.Username}: QueueLength={userInfo.QueueLength}, HasFreeSlot={userInfo.HasFreeUploadSlot}");
+					}
+				}
+				catch (Exception ex)
+				{
+					// Log the error but continue checking other users
+					Log.Warning($"Could not get user info for {response.Username}: {ex.Message}");
+				}
+			}
 
-        private static bool IsValidFlac(Soulseek.File file)
-        {
-            return file.Filename.ToUpper().EndsWith(FlacExtension)
-                && (file.Extension.ToUpper() == FlacExtension || string.IsNullOrEmpty(file.Extension));
-        }
+			// Return the first response that meets all criteria (already ordered by speed in SearchAsync)
+			// Or potentially order by other criteria here if needed, e.g., average speed again if GetUserInfoAsync provided it.
+			// The original code returns the first match from the filtered list.
+			return filteredResponses.FirstOrDefault();
+		}
 
-        private static Soulseek.File? SelectFile(IEnumerable<Soulseek.File> files, SoulseekOptions options, int? expectedTrackLength = null)
-        {
-            //pick right file
-            if (options.AllowFlac)
-            {
-                files = files.Where(file => IsValidMp3(file) || IsValidFlac(file));
-            }
-            else
-            {
-                files = files.Where(IsValidMp3);
-            }
+		private static bool IsValidMp3(Soulseek.File file)
+		{
+			const int minimalBitRate = 320;
 
-            //filter for expected length of song based on spotify
-            if (expectedTrackLength != null)
-            {
-                files = files.Where(file => file.Length.HasValue && Math.Abs(file.Length!.Value - expectedTrackLength.Value) < 2000);
-            }
+			// Check if file, BitRate, and Length have values before using them
+			if (file == null || !file.BitRate.HasValue || !file.Length.HasValue || file.Length.Value <= 0)
+			{
+				return false; // Cannot validate if essential info is missing or invalid
+			}
 
-            //sort on size descending so that we get the biggest file (assuming this has the highest quality)
-            return files.Any()
-                ? files.OrderByDescending(file => file.Size).First()
-                : null;
-        }
+			// Now it's safe to access .Value
+			bool bitrateOk = file.BitRate.Value >= minimalBitRate;
+			// Recalculate bitrate using size/length to double-check metadata consistency
+			bool recalculatedBitrateOk = (file.Size * 8 / file.Length.Value / 1000) >= minimalBitRate;
+			bool extensionOk = file.Filename.ToUpper().EndsWith(Mp3Extension)
+							   && (string.IsNullOrEmpty(file.Extension) || file.Extension.ToUpper() == Mp3Extension.TrimStart('.')); // Trim '.' for comparison
+
+			return bitrateOk && recalculatedBitrateOk && extensionOk;
+		}
+
+
+		private static bool IsValidFlac(Soulseek.File file)
+		{
+			if (file == null) {
+				return false;
+			}
+			// Basic check for FLAC extension
+			return file.Filename.ToUpper().EndsWith(FlacExtension)
+				   && (string.IsNullOrEmpty(file.Extension) || file.Extension.ToUpper() == FlacExtension.TrimStart('.'));
+		}
+
+// Source/Assemblies/Spotify.Slsk.Integration/Services/SoulSeek/SoulseekService.cs
+
+		private static Soulseek.File? SelectFile(IEnumerable<Soulseek.File> files, SoulseekOptions options, int? expectedTrackLength = null)
+		{
+			IEnumerable<Soulseek.File> validFiles;
+
+			// Pick right file based on options (MP3 or MP3+FLAC)
+			if (options.AllowFlac)
+			{
+				validFiles = files.Where(file => IsValidMp3(file) || IsValidFlac(file));
+			}
+			else
+			{
+				validFiles = files.Where(IsValidMp3);
+			}
+
+			// Filter for expected length of song based on spotify, if provided
+			if (expectedTrackLength != null)
+			{
+				const int lengthToleranceMs = 5000; // Increased tolerance to 5 seconds
+				// IMPORTANT: Check HasValue before comparing
+				validFiles = validFiles.Where(file => file.Length.HasValue
+												 && Math.Abs(file.Length.Value - expectedTrackLength.Value) < lengthToleranceMs);
+			}
+
+			// Sort on size descending so that we get the biggest file (assuming this has the highest quality)
+			// For FLAC vs MP3, FLAC usually larger, so prefer FLAC if both exist and are valid.
+			// If AllowFlac is true, prioritize FLAC.
+			if (options.AllowFlac)
+			{
+				 return validFiles
+						.OrderByDescending(file => file.Filename.ToUpper().EndsWith(FlacExtension)) // Prioritize FLAC
+						.ThenByDescending(file => file.Size) // Then by size
+						.FirstOrDefault();
+			}
+			else // Only MP3s considered
+			{
+				return validFiles
+						.OrderByDescending(file => file.Size)
+						.FirstOrDefault();
+			}
+		}
 
         private static void RemoveQueuedDownloads()
         {

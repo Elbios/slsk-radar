@@ -88,11 +88,11 @@ namespace Spotify.Slsk.Integration.Services.Download
 
             string playlistName = playlistItem.Name!;
             Log.Information($"Attempting to download '{tracksToDownload.Count}' files...");
-            await DownloadTracksInParallelAsync(ssUsername, ssPassword, spotifyAccessToken, tracksToDownload, playlistName, options, setId3Tags, musicalKeyFormat, save: true);
+            await DownloadTracksInParallelAsync(ssUsername, ssPassword, spotifyAccessToken, tracksToDownload, playlistName, options, setId3Tags, musicalKeyFormat, save: false);
         }
 
         private async Task DownloadTracksInParallelAsync(string ssUsername, string ssPassword, string spotifyAccessToken, List<TrackToDownload> tracksToDownload, string playlistName,
-            SoulseekOptions options, bool setId3Tags, MusicalKeyFormat musicalKeyFormat, bool save = true)
+            SoulseekOptions options, bool setId3Tags, MusicalKeyFormat musicalKeyFormat, bool save = false)
         {
             SemaphoreSlim semaphoreSlim = new(5);
             IEnumerable<Task> tasks = tracksToDownload.Select(async trackToDownload =>

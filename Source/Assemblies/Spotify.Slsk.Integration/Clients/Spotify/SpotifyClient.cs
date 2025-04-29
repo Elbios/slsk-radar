@@ -52,8 +52,9 @@ namespace Spotify.Slsk.Integration.Services.Spotify
             string endpoint = $"me/tracks";
             string queryParams = $"?ids={track.Track!.Id}";
 
-            HttpRequestMessage request = new(HttpMethod.Put, $"{SPOTIFY_BASE_URL}{endpoint}{queryParams}");
-            _ = await GetResponseAsync(request, accessToken);
+// REMOVED
+//            HttpRequestMessage request = new(HttpMethod.Put, $"{SPOTIFY_BASE_URL}{endpoint}{queryParams}");
+ //           _ = await GetResponseAsync(request, accessToken);
         }
 
         public async Task<List<TrackItem>> GetAllSavedTracksAsync(string accessToken)
