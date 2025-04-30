@@ -1,7 +1,7 @@
 ﻿using System;
 using System.Reflection;
 using System.Threading.Tasks;
-using Spotify.Slsk.Integration.Cli.Commands.SubCommands;
+using Spotify.Slsk.Integration.Cli.Commands.SubCommands; // Ensure this namespace is included
 using McMaster.Extensions.CommandLineUtils;
 using Microsoft.Extensions.Logging;
 
@@ -14,7 +14,8 @@ namespace Spotify.Slsk.Integration.Cli.Commands
         typeof(TranslateMusicalKeyCommand),
         typeof(DownloadTrackCommand),
         typeof(DownloadAndSavePlaylistCommand),
-        typeof(DownloadPlaylistCommand))]
+        typeof(DownloadPlaylistCommand),
+        typeof(SoulseekRadarCommand))] // <-- Add the new command here
     class SpotseekCommand : SpotSeekCommandBase
     {
         public SpotseekCommand(ILogger<SpotseekCommand> logger, IConsole console)
@@ -34,4 +35,3 @@ namespace Spotify.Slsk.Integration.Cli.Commands
             => typeof(SpotseekCommand).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>().InformationalVersion;
     }
 }
-
