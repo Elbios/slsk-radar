@@ -42,29 +42,29 @@ namespace Spotify.Slsk.Integration.Services
                 await SoulseekService.ConnectAndLoginAsync(_soulseekClient, ssUsername, ssPassword);
                 _logger.LogInformation("Connected and logged in.");
 
-				// --- Step 1: Seed Search ---
-				_logger.LogInformation("STEP 1: Searching for '{Seed}' (timeout {T}s)", seedTrackQuery, _options.SearchTimeoutSeconds);
-				IReadOnlyCollection<SearchResponse> responses;
-				try
-				{
-					var searchResult = await _soulseekClient.SearchAsync(
-						SearchQuery.FromText(seedTrackQuery),
-						options: new SearchOptions(
-							searchTimeout: _options.SearchTimeoutSeconds * 1000,
-							stateChanged: e => _logger.LogTrace("Search state: {State}", e.Search.State),
-							responseReceived: e => _logger.LogTrace("Received response from {User}", e.Response.Username)
-						)
-					);
-					responses = searchResult.Responses;
-					_logger.LogDebug("SearchAsync completed. State: {State}", searchResult.Search.State);
-				}
-				catch (OperationCanceledException)
-				{
-					_logger.LogWarning("Search timed out after {T}s for '{Seed}'", _options.SearchTimeoutSeconds, seedTrackQuery);
-					responses = Array.Empty<SearchResponse>();
-				}
+                // --- Step 1: Seed Search ---
+                _logger.LogInformation("STEP 1: Searching for '{Seed}' (timeout {T}s)", seedTrackQuery, _options.SearchTimeoutSeconds);
+                IReadOnlyCollection<SearchResponse> responses;
+                try
+                {
+                    var result = await _soulseekClient.SearchAsync(
+                        SearchQuery.FromText(seedTrackQuery),
+                        options: new SearchOptions(
+                            searchTimeout: _options.SearchTimeoutSeconds * 1000,
+                            stateChanged: e => _logger.LogTrace("Search state: {State}", e.Search.State),
+                            responseReceived: e => _logger.LogTrace("Received response from {User}", e.Response.Username)
+                        )
+                    );
+                    responses = result.Responses;
+                    _logger.LogDebug("SearchAsync completed. State: {State}", result.Search.State);
+                }
+                catch (OperationCanceledException)
+                {
+                    _logger.LogWarning("Search timed out after {T}s for '{Seed}'", _options.SearchTimeoutSeconds, seedTrackQuery);
+                    responses = Array.Empty<SearchResponse>();
+                }
 
-                // Dedupe & free-slot filter
+                // Filter & dedupe
                 var uniqueUsers = responses
                     .Where(r => r.HasFreeUploadSlot)
                     .GroupBy(r => r.Username)
@@ -73,144 +73,73 @@ namespace Spotify.Slsk.Integration.Services
                 _logger.LogInformation("Found {Count} unique users with free slots.", uniqueUsers.Count);
                 if (!uniqueUsers.Any())
                 {
-                    _logger.LogWarning("No candidates; exiting.");
+                    _logger.LogWarning("No candidates to proceed with. Exiting.");
                     await DisconnectGracefullyAsync();
                     return;
                 }
 
                 // --- Step 2: Stats & select ---
                 _logger.LogInformation("STEP 2: Fetching stats (timeout {T}s)...", _options.PerPeerTimeoutSeconds);
-                var shareData = new List<(string User,int Size)>();
-                foreach (var u in uniqueUsers.OrderByDescending(u => u.UploadSpeed).Take(_options.MaxUsers * 2))
+                var shareData = new List<(string Username, int Size)>();
+                foreach (var u in uniqueUsers
+                                    .OrderByDescending(u => u.UploadSpeed)
+                                    .Take(_options.MaxUsers * 2))
                 {
-                    _logger.LogDebug("Stats for {User}", u.Username);
+                    _logger.LogDebug("Fetching stats for {User}", u.Username);
                     try
                     {
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
                         var stats = await _soulseekClient.GetUserStatisticsAsync(u.Username, cts.Token);
                         if (stats.FileCount >= MinShareSizeFiles)
+                        {
                             shareData.Add((u.Username, stats.FileCount));
+                            _logger.LogTrace("  -> {User} has {Count} files", u.Username, stats.FileCount);
+                        }
+                        else
+                        {
+                            _logger.LogTrace("  -> Skipping {User}, only {Count} files", u.Username, stats.FileCount);
+                        }
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Skipping {User}", u.Username);
+                        _logger.LogWarning(ex, "Skipping stats for {User}", u.Username);
                     }
                 }
+
                 if (!shareData.Any())
                 {
-                    _logger.LogWarning("No share-size qualifiers; exiting.");
+                    _logger.LogWarning("No users passed share-size filter. Exiting.");
                     await DisconnectGracefullyAsync();
                     return;
                 }
 
-                var selected = shareData.OrderBy(x => x.Size).Take(_options.MaxUsers).ToList();
-                _logger.LogInformation("Selected users: {Users}", selected.Select(x => x.User));
-
-                // --- Step 3: Crawl & pick for first user ---
-                var firstUser = selected.First().User;
-                _logger.LogInformation("STEP 3: Crawling share of {User}", firstUser);
-
-                var browse = await _soulseekClient.BrowseAsync(firstUser);
-                _logger.LogDebug("Browse returned {D} dirs", browse.Directories.Count);
-
-                // raw seed-path from search result
-                var rawSeed = uniqueUsers.First(r => r.Username == firstUser).Files.First().Filename;
-                _logger.LogTrace("Raw seed path: '{Raw}'", rawSeed);
-
-                // trim @@* segments
-                var parts = rawSeed.Split('\\');
-                int ti = 0;
-                while (ti < parts.Length && parts[ti].StartsWith("@@"))
-                {
-                    _logger.LogTrace("Trimming '{S}'", parts[ti]);
-                    ti++;
-                }
-                var trimmed = parts.Skip(ti).ToArray();
-                var normPath = string.Join("\\", trimmed);
-                _logger.LogDebug("Normalized seed path: '{Norm}'", normPath);
-
-                // manual split on last backslash
-                int idx = normPath.LastIndexOf('\\');
-                string seedFolder = idx >= 0 ? normPath.Substring(0, idx) : "";
-                string seedFile   = idx >= 0 ? normPath[(idx + 1)..] : normPath;
-                _logger.LogDebug("SeedFolder='{F}', SeedFile='{f}'", seedFolder, seedFile);
-
-                // match any directory whose Name endsWith the seedFolder
-                var matches = browse.Directories
-                    .Where(d => d.Name.EndsWith(seedFolder, StringComparison.InvariantCultureIgnoreCase))
+                var selected = shareData
+                    .OrderBy(x => x.Size)
+                    .Take(_options.MaxUsers)
+                    .Select(x => x.Username)
                     .ToList();
-                _logger.LogDebug("Directories ending with '{F}': {C}", seedFolder, matches.Count);
+                _logger.LogInformation("Selected users: {Users}", selected);
 
-                if (!matches.Any())
+                // --- Step 3: Crawl & pick for all selected users ---
+                _logger.LogInformation("STEP 3: Crawling shares and selecting up to {N} tracks per user...", RecommendationsPerUser);
+
+                // Pre-fetch entire share for each user and pick
+                var allPicks = new Dictionary<string, List<string>>();
+                foreach (var user in selected)
                 {
-                    _logger.LogWarning("No directory matches '{F}'. Listing all:", seedFolder);
-                    foreach (var d in browse.Directories)
-                        _logger.LogWarning(" - '{Dir}'", d.Name);
-                }
-                else
-                {
-                    var dir = matches.First();
-                    var fileEntry = dir.Files.FirstOrDefault(f => f.Filename.Equals(seedFile, StringComparison.InvariantCultureIgnoreCase));
-                    if (fileEntry == null)
-                    {
-                        _logger.LogWarning("Could not find file '{f}' in directory '{F}'", seedFile, dir.Name);
-                    }
-                    else
-                    {
-                        // now pick sibling tracks
-                        var baseArtist = Normalize(dir.Name[(dir.Name.LastIndexOf('\\') + 1)..]);
-                        var allDirs = browse.Directories.ToList();
-                        var locked  = new HashSet<string>(browse.LockedDirectories.Select(x => x.Name));
-                        var picks   = new List<string>();
-                        var current = dir.Name;
-                        while (picks.Count < RecommendationsPerUser && current.Contains("\\"))
-                        {
-                            var parent = current[..current.LastIndexOf('\\')];
-                            _logger.LogTrace("Up to '{P}'", parent);
-
-                            var siblings = allDirs.Select(d => d.Name)
-                                .Where(p =>
-                                    p.StartsWith(parent + "\\") &&
-                                    p.LastIndexOf('\\') == parent.Length)
-                                .Except(locked)
-                                .Except(new[] { current })
-                                .ToList();
-                            Shuffle(siblings);
-
-                            foreach (var s in siblings)
-                            {
-                                var art = Normalize(s[(s.LastIndexOf('\\') + 1)..]);
-                                if (art == baseArtist) continue;
-
-                                var dobj = allDirs.Single(d => d.Name == s);
-                                var cands = dobj.Files
-                                    .Where(f => f.Size > 0)
-                                    .Select(f => $"{s}\\{f.Filename}")
-                                    .Where(path =>
-                                    {
-                                        var ext = Path.GetExtension(path)?.ToLowerInvariant();
-                                        return ext is ".mp3" or ".flac" or ".m4a" or ".ogg";
-                                    })
-                                    .ToList();
-
-                                if (cands.Any())
-                                {
-                                    var pick = cands[new Random().Next(cands.Count)];
-                                    picks.Add(pick);
-                                    _logger.LogInformation("Picked '{Pick}'", pick);
-                                    if (picks.Count == RecommendationsPerUser) break;
-                                }
-                            }
-
-                            current = parent;
-                        }
-
-                        _logger.LogInformation("STEP 3 picks for {U}: {Count} → {List}",
-                            firstUser, picks.Count, picks);
-                    }
+                    _logger.LogInformation("Crawling & picking for {User}...", user);
+                    var picks = await CrawlAndPickAsync(user, uniqueUsers.First(r => r.Username == user));
+                    allPicks[user] = picks;
+                    _logger.LogInformation("  {Count} picks: {Tracks}", picks.Count, picks);
                 }
 
-                _logger.LogInformation("Done.");
+                _logger.LogInformation("All picks completed:");
+                foreach (var kv in allPicks)
+                {
+                    _logger.LogInformation(" • {User}: {Tracks}", kv.Key, kv.Value);
+                }
+
+                _logger.LogInformation("Discovery finished (picks ready).");
             }
             catch (Exception ex)
             {
@@ -222,11 +151,116 @@ namespace Spotify.Slsk.Integration.Services
             }
         }
 
+        private async Task<List<string>> CrawlAndPickAsync(string username, SearchResponse seedResp)
+        {
+            var picks = new List<string>();
+
+            // 1) Browse entire share
+            var browse = await _soulseekClient.BrowseAsync(username);
+            _logger.LogDebug("  BrowseAsync for {User}: {D} dirs, {L} locked", username,
+                browse.Directories.Count, browse.LockedDirectories.Count);
+
+            // 2) Normalize seed path
+            var rawSeed = seedResp.Files.First().Filename;
+            _logger.LogTrace("  Raw seed path: '{Raw}'", rawSeed);
+
+            // Trim any leading @@* segments
+            var parts = rawSeed.Split('\\');
+            int ti = 0;
+            while (ti < parts.Length && parts[ti].StartsWith("@@"))
+            {
+                _logger.LogTrace("    Trimming '{S}'", parts[ti]);
+                ti++;
+            }
+            var trimmed = parts.Skip(ti).ToArray();
+            var normPath = string.Join("\\", trimmed);
+            _logger.LogDebug("    Normalized seed path: '{Norm}'", normPath);
+
+            // Split on last backslash
+            int idx = normPath.LastIndexOf('\\');
+            string seedFolder = idx >= 0 ? normPath.Substring(0, idx) : "";
+            string seedFile   = idx >= 0 ? normPath[(idx + 1)..] : normPath;
+            _logger.LogDebug("    SeedFolder='{F}', SeedFile='{f}'", seedFolder, seedFile);
+
+            // Find matching directory by ends-with
+            var dirs = browse.Directories;
+            var matches = dirs
+                .Where(d => d.Name.EndsWith(seedFolder, StringComparison.InvariantCultureIgnoreCase))
+                .ToList();
+            _logger.LogDebug("    Directories ending with '{F}': {C}", seedFolder, matches.Count);
+
+            if (!matches.Any())
+            {
+                _logger.LogWarning("    No folder matches '{F}'. Listing all:", seedFolder);
+                foreach (var d in dirs)
+                    _logger.LogWarning("     - '{Dir}'", d.Name);
+                return picks;
+            }
+
+            var seedDir = matches.First();
+            var fileEntry = seedDir.Files
+                .FirstOrDefault(f => f.Filename.Equals(seedFile, StringComparison.InvariantCultureIgnoreCase));
+            if (fileEntry == null)
+            {
+                _logger.LogWarning("    Could not find file '{f}' in '{Dir}'", seedFile, seedDir.Name);
+                return picks;
+            }
+
+            // 3) Traverse up and pick siblings
+            var baseArtist = Normalize(seedDir.Name[(seedDir.Name.LastIndexOf('\\') + 1)..]);
+            var allDirs = browse.Directories.ToList();
+            var locked  = new HashSet<string>(browse.LockedDirectories.Select(d => d.Name));
+            var current = seedDir.Name;
+
+            while (picks.Count < RecommendationsPerUser && current.Contains("\\"))
+            {
+                var parent = current[..current.LastIndexOf('\\')];
+                _logger.LogTrace("    Ascend to '{P}'", parent);
+
+                var siblings = allDirs.Select(d => d.Name)
+                    .Where(p =>
+                        p.StartsWith(parent + "\\") &&
+                        p.LastIndexOf('\\') == parent.Length)
+                    .Except(locked)
+                    .Except(new[] { current })
+                    .ToList();
+                Shuffle(siblings);
+
+                foreach (var sib in siblings)
+                {
+                    var artistNorm = Normalize(sib[(sib.LastIndexOf('\\') + 1)..]);
+                    if (artistNorm == baseArtist) continue;
+
+                    var dirObj = allDirs.Single(d => d.Name == sib);
+                    var cands = dirObj.Files
+                        .Where(f => f.Size > 0)
+                        .Select(f => $"{sib}\\{f.Filename}")
+                        .Where(fp =>
+                        {
+                            var ext = Path.GetExtension(fp)?.ToLowerInvariant();
+                            return ext is ".mp3" or ".flac" or ".m4a" or ".ogg";
+                        })
+                        .ToList();
+
+                    if (cands.Any())
+                    {
+                        var pick = cands[new Random().Next(cands.Count)];
+                        picks.Add(pick);
+                        _logger.LogInformation("    Picked: {Pick}", pick);
+                        if (picks.Count == RecommendationsPerUser) break;
+                    }
+                }
+                current = parent;
+            }
+
+            return picks;
+        }
+
         private async Task DisconnectGracefullyAsync()
         {
             if (_soulseekClient?.State != SoulseekClientStates.Disconnected)
             {
-                _logger.LogInformation("Disconnecting...");
+                _logger.LogInformation("Disconnecting from Soulseek...");
                 _soulseekClient.Disconnect();
                 _logger.LogInformation("Disconnected.");
             }
@@ -234,9 +268,9 @@ namespace Spotify.Slsk.Integration.Services
 
         private static string Normalize(string s) =>
             (s ?? "")
-            .Replace('_','-')
+            .Replace('_', '-')
             .ToLowerInvariant()
-            .Split(new[]{' ','-'},StringSplitOptions.RemoveEmptyEntries)
+            .Split(new[] { ' ', '-' }, StringSplitOptions.RemoveEmptyEntries)
             .FirstOrDefault() ?? "";
 
         private static void Shuffle<T>(IList<T> list)
