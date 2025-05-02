@@ -1,10 +1,11 @@
-// Source/Assemblies/Spotify.Slsk.Integration/Services/SoulseekRadarService.cs
+// SoulseekRadarService.cs
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using Spotify.Slsk.Integration.Models;
 using Spotify.Slsk.Integration.Models.Exceptions;
 using Spotify.Slsk.Integration.Services.SoulSeek;
 using Soulseek;
+using FuzzySharp;               // <-- Fuzzy matching
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -22,8 +23,12 @@ namespace Spotify.Slsk.Integration.Services
 
         private const int MinShareSizeFiles = 50;
         private const int RecommendationsPerUser = 2;
+        private const int SimilarityThreshold = 80;      // Fuzzy ratio threshold
 
-        public SoulseekRadarService(ILogger<SoulseekRadarService> logger, SoulseekClient soulseekClient, IConfiguration configuration)
+        public SoulseekRadarService(
+            ILogger<SoulseekRadarService> logger,
+            SoulseekClient soulseekClient,
+            IConfiguration configuration)
         {
             _logger = logger;
             _soulseekClient = soulseekClient;
@@ -32,18 +37,22 @@ namespace Spotify.Slsk.Integration.Services
             _logger.LogInformation("SoulseekRadarService initialized with options: {@Options}", _options);
         }
 
-        public async Task DiscoverTracksAsync(string seedTrackQuery, string ssUsername, string ssPassword)
+        public async Task DiscoverTracksAsync(
+            string seedTrackQuery,
+            string ssUsername,
+            string ssPassword)
         {
             _logger.LogInformation("Starting Soulseek-Radar discovery for seed: '{Seed}'", seedTrackQuery);
-
             try
             {
-                // Connect & login
                 await SoulseekService.ConnectAndLoginAsync(_soulseekClient, ssUsername, ssPassword);
                 _logger.LogInformation("Connected and logged in.");
 
-                // --- Step 1: Seed Search ---
-                _logger.LogInformation("STEP 1: Searching for '{Seed}' (timeout {T}s)", seedTrackQuery, _options.SearchTimeoutSeconds);
+                // Step 1: Search seed
+                _logger.LogInformation(
+                    "STEP 1: Searching for '{Seed}' (timeout {T}s)",
+                    seedTrackQuery, _options.SearchTimeoutSeconds);
+
                 IReadOnlyCollection<SearchResponse> responses;
                 try
                 {
@@ -52,15 +61,16 @@ namespace Spotify.Slsk.Integration.Services
                         options: new SearchOptions(
                             searchTimeout: _options.SearchTimeoutSeconds * 1000,
                             stateChanged: e => _logger.LogTrace("Search state: {State}", e.Search.State),
-                            responseReceived: e => _logger.LogTrace("Received response from {User}", e.Response.Username)
+                            responseReceived: e => _logger.LogTrace("Resp from {User}", e.Response.Username)
                         )
                     );
                     responses = result.Responses;
-                    _logger.LogDebug("SearchAsync completed. State: {State}", result.Search.State);
+                    _logger.LogDebug("Search completed. State: {State}", result.Search.State);
                 }
                 catch (OperationCanceledException)
                 {
-                    _logger.LogWarning("Search timed out after {T}s for '{Seed}'", _options.SearchTimeoutSeconds, seedTrackQuery);
+                    _logger.LogWarning("Search timed out after {T}s for '{Seed}'",
+                        _options.SearchTimeoutSeconds, seedTrackQuery);
                     responses = Array.Empty<SearchResponse>();
                 }
 
@@ -73,36 +83,41 @@ namespace Spotify.Slsk.Integration.Services
                 _logger.LogInformation("Found {Count} unique users with free slots.", uniqueUsers.Count);
                 if (!uniqueUsers.Any())
                 {
-                    _logger.LogWarning("No candidates to proceed with. Exiting.");
+                    _logger.LogWarning("No candidates. Exiting.");
                     await DisconnectGracefullyAsync();
                     return;
                 }
 
-                // --- Step 2: Stats & select ---
-                _logger.LogInformation("STEP 2: Fetching stats (timeout {T}s)...", _options.PerPeerTimeoutSeconds);
+                // Step 2: Fetch stats & select
+                _logger.LogInformation(
+                    "STEP 2: Fetching stats (timeout {T}s)...", _options.PerPeerTimeoutSeconds);
+
                 var shareData = new List<(string Username, int Size)>();
                 foreach (var u in uniqueUsers
-                                    .OrderByDescending(u => u.UploadSpeed)
-                                    .Take(_options.MaxUsers * 2))
+                    .OrderByDescending(u => u.UploadSpeed)
+                    .Take(_options.MaxUsers * 2))
                 {
-                    _logger.LogDebug("Fetching stats for {User}", u.Username);
+                    _logger.LogDebug("Stats for {U}", u.Username);
                     try
                     {
-                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
-                        var stats = await _soulseekClient.GetUserStatisticsAsync(u.Username, cts.Token);
+                        using var cts = new CancellationTokenSource(
+                            TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
+                        var stats = await _soulseekClient
+                            .GetUserStatisticsAsync(u.Username, cts.Token);
+
                         if (stats.FileCount >= MinShareSizeFiles)
                         {
                             shareData.Add((u.Username, stats.FileCount));
-                            _logger.LogTrace("  -> {User} has {Count} files", u.Username, stats.FileCount);
+                            _logger.LogTrace(" → {U}: {F} files", u.Username, stats.FileCount);
                         }
                         else
                         {
-                            _logger.LogTrace("  -> Skipping {User}, only {Count} files", u.Username, stats.FileCount);
+                            _logger.LogTrace(" → Skipping {U}: only {F} files", u.Username, stats.FileCount);
                         }
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Skipping stats for {User}", u.Username);
+                        _logger.LogWarning(ex, "Skipping stats for {U}", u.Username);
                     }
                 }
 
@@ -113,33 +128,27 @@ namespace Spotify.Slsk.Integration.Services
                     return;
                 }
 
-                var selected = shareData
+                var selectedUsers = shareData
                     .OrderBy(x => x.Size)
                     .Take(_options.MaxUsers)
                     .Select(x => x.Username)
                     .ToList();
-                _logger.LogInformation("Selected users: {Users}", selected);
+                _logger.LogInformation("Selected users: {Users}", selectedUsers);
 
-                // --- Step 3: Crawl & pick for all selected users ---
-                _logger.LogInformation("STEP 3: Crawling shares and selecting up to {N} tracks per user...", RecommendationsPerUser);
-
-                // Pre-fetch entire share for each user and pick
+                // Step 3: Crawl & pick for all
+                _logger.LogInformation("STEP 3: Crawling shares and picking up to {N} tracks each", RecommendationsPerUser);
                 var allPicks = new Dictionary<string, List<string>>();
-                foreach (var user in selected)
+
+                foreach (var user in selectedUsers)
                 {
-                    _logger.LogInformation("Crawling & picking for {User}...", user);
-                    var picks = await CrawlAndPickAsync(user, uniqueUsers.First(r => r.Username == user));
+                    _logger.LogInformation("Processing user {U}...", user);
+                    var seedResp = uniqueUsers.First(r => r.Username == user);
+                    var picks = await CrawlAndPickAsync(user, seedResp);
                     allPicks[user] = picks;
-                    _logger.LogInformation("  {Count} picks: {Tracks}", picks.Count, picks);
+                    _logger.LogInformation(" → {Count} picks: {List}", picks.Count, picks);
                 }
 
-                _logger.LogInformation("All picks completed:");
-                foreach (var kv in allPicks)
-                {
-                    _logger.LogInformation(" • {User}: {Tracks}", kv.Key, kv.Value);
-                }
-
-                _logger.LogInformation("Discovery finished (picks ready).");
+                _logger.LogInformation("Discovery finished, recommendations ready!");
             }
             catch (Exception ex)
             {
@@ -151,63 +160,62 @@ namespace Spotify.Slsk.Integration.Services
             }
         }
 
-        private async Task<List<string>> CrawlAndPickAsync(string username, SearchResponse seedResp)
+        private async Task<List<string>> CrawlAndPickAsync(
+            string username,
+            SearchResponse seedResp)
         {
             var picks = new List<string>();
 
             // 1) Browse entire share
             var browse = await _soulseekClient.BrowseAsync(username);
-            _logger.LogDebug("  BrowseAsync for {User}: {D} dirs, {L} locked", username,
-                browse.Directories.Count, browse.LockedDirectories.Count);
+            _logger.LogDebug("Browse for {U}: {D} dirs, {L} locked",
+                username, browse.Directories.Count, browse.LockedDirectories.Count);
 
-            // 2) Normalize seed path
-            var rawSeed = seedResp.Files.First().Filename;
-            _logger.LogTrace("  Raw seed path: '{Raw}'", rawSeed);
+            // 2) Normalize seed path & artist/title
+            var raw = seedResp.Files.First().Filename;
+            _logger.LogTrace(" Raw seed: '{Raw}'", raw);
 
-            // Trim any leading @@* segments
-            var parts = rawSeed.Split('\\');
+            // Trim leading @@*
+            var segs = raw.Split('\\');
             int ti = 0;
-            while (ti < parts.Length && parts[ti].StartsWith("@@"))
-            {
-                _logger.LogTrace("    Trimming '{S}'", parts[ti]);
+            while (ti < segs.Length && segs[ti].StartsWith("@@"))
                 ti++;
-            }
-            var trimmed = parts.Skip(ti).ToArray();
+            var trimmed = segs.Skip(ti).ToArray();
             var normPath = string.Join("\\", trimmed);
-            _logger.LogDebug("    Normalized seed path: '{Norm}'", normPath);
+            _logger.LogDebug(" Norm path: '{P}'", normPath);
 
-            // Split on last backslash
             int idx = normPath.LastIndexOf('\\');
-            string seedFolder = idx >= 0 ? normPath.Substring(0, idx) : "";
-            string seedFile   = idx >= 0 ? normPath[(idx + 1)..] : normPath;
-            _logger.LogDebug("    SeedFolder='{F}', SeedFile='{f}'", seedFolder, seedFile);
+            var seedFolder = idx >= 0 ? normPath[..idx] : "";
+            var seedFile   = idx >= 0 ? normPath[(idx + 1)..] : normPath;
+            _logger.LogDebug(" Folder='{F}', File='{f}'", seedFolder, seedFile);
 
-            // Find matching directory by ends-with
             var dirs = browse.Directories;
             var matches = dirs
                 .Where(d => d.Name.EndsWith(seedFolder, StringComparison.InvariantCultureIgnoreCase))
                 .ToList();
-            _logger.LogDebug("    Directories ending with '{F}': {C}", seedFolder, matches.Count);
-
             if (!matches.Any())
             {
-                _logger.LogWarning("    No folder matches '{F}'. Listing all:", seedFolder);
-                foreach (var d in dirs)
-                    _logger.LogWarning("     - '{Dir}'", d.Name);
+                _logger.LogWarning(" No folder matches '{F}'. Available:", seedFolder);
+                foreach (var d in dirs) _logger.LogWarning("  - '{N}'", d.Name);
                 return picks;
             }
 
             var seedDir = matches.First();
-            var fileEntry = seedDir.Files
+            var entry   = seedDir.Files
                 .FirstOrDefault(f => f.Filename.Equals(seedFile, StringComparison.InvariantCultureIgnoreCase));
-            if (fileEntry == null)
+            if (entry == null)
             {
-                _logger.LogWarning("    Could not find file '{f}' in '{Dir}'", seedFile, seedDir.Name);
+                _logger.LogWarning(" Could not find '{f}' in '{D}'", seedFile, seedDir.Name);
                 return picks;
             }
 
-            // 3) Traverse up and pick siblings
-            var baseArtist = Normalize(seedDir.Name[(seedDir.Name.LastIndexOf('\\') + 1)..]);
+            // Pre‐compute normalized tokens
+            var seedArtist = Normalize(seedDir.Name[(seedDir.Name.LastIndexOf('\\') + 1)..]);
+            var seedTitle  = Normalize(Path.GetFileNameWithoutExtension(seedFile));
+            _logger.LogTrace(" SeedArtist='{A}', SeedTitle='{T}'",
+                seedArtist, seedTitle);
+
+            // 3) Traverse upward & pick siblings
             var allDirs = browse.Directories.ToList();
             var locked  = new HashSet<string>(browse.LockedDirectories.Select(d => d.Name));
             var current = seedDir.Name;
@@ -215,7 +223,7 @@ namespace Spotify.Slsk.Integration.Services
             while (picks.Count < RecommendationsPerUser && current.Contains("\\"))
             {
                 var parent = current[..current.LastIndexOf('\\')];
-                _logger.LogTrace("    Ascend to '{P}'", parent);
+                _logger.LogTrace(" Ascend to '{P}'", parent);
 
                 var siblings = allDirs.Select(d => d.Name)
                     .Where(p =>
@@ -229,27 +237,42 @@ namespace Spotify.Slsk.Integration.Services
                 foreach (var sib in siblings)
                 {
                     var artistNorm = Normalize(sib[(sib.LastIndexOf('\\') + 1)..]);
-                    if (artistNorm == baseArtist) continue;
+                    // Skip exact or fuzzy-similar artist
+                    if (artistNorm == seedArtist ||
+                        Fuzz.Ratio(artistNorm, seedArtist) >= SimilarityThreshold)
+                    {
+                        _logger.LogTrace("  Skip artist '{A}' (too similar)", artistNorm);
+                        continue;
+                    }
 
                     var dirObj = allDirs.Single(d => d.Name == sib);
-                    var cands = dirObj.Files
+                    var candidates = dirObj.Files
                         .Where(f => f.Size > 0)
                         .Select(f => $"{sib}\\{f.Filename}")
-                        .Where(fp =>
+                        .Where(path =>
                         {
-                            var ext = Path.GetExtension(fp)?.ToLowerInvariant();
-                            return ext is ".mp3" or ".flac" or ".m4a" or ".ogg";
+                            var ext = Path.GetExtension(path)?.ToLowerInvariant();
+                            if (ext is not (".mp3" or ".flac" or ".m4a" or ".ogg"))
+                                return false;
+
+                            var titleNorm = Normalize(
+                                Path.GetFileNameWithoutExtension(path));
+                            // Skip exact or fuzzy-similar title
+                            return titleNorm != seedTitle &&
+                                   Fuzz.Ratio(titleNorm, seedTitle) < SimilarityThreshold;
                         })
                         .ToList();
 
-                    if (cands.Any())
+                    _logger.LogTrace("  {Count} valid candidates in '{S}'", candidates.Count, sib);
+                    if (candidates.Any())
                     {
-                        var pick = cands[new Random().Next(cands.Count)];
+                        var pick = candidates[new Random().Next(candidates.Count)];
                         picks.Add(pick);
-                        _logger.LogInformation("    Picked: {Pick}", pick);
+                        _logger.LogInformation("  Picked: {Pick}", pick);
                         if (picks.Count == RecommendationsPerUser) break;
                     }
                 }
+
                 current = parent;
             }
 
@@ -260,7 +283,7 @@ namespace Spotify.Slsk.Integration.Services
         {
             if (_soulseekClient?.State != SoulseekClientStates.Disconnected)
             {
-                _logger.LogInformation("Disconnecting from Soulseek...");
+                _logger.LogInformation("Disconnecting...");
                 _soulseekClient.Disconnect();
                 _logger.LogInformation("Disconnected.");
             }
