@@ -5,13 +5,12 @@ using Spotify.Slsk.Integration.Models;
 using Spotify.Slsk.Integration.Models.Exceptions;
 using Spotify.Slsk.Integration.Services.SoulSeek;
 using Soulseek;
-//using Soulseek.Entities; // Added for UserStatistics type
-//using Soulseek.Exceptions;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System;
+using System.IO;
 
 namespace Spotify.Slsk.Integration.Services
 {
@@ -21,8 +20,8 @@ namespace Spotify.Slsk.Integration.Services
         private readonly SoulseekClient _soulseekClient;
         private readonly SoulseekRadarOptions _options;
 
-        // Minimum share size threshold
         private const int MinShareSizeFiles = 50;
+        private const int RecommendationsPerUser = 2;
 
         public SoulseekRadarService(ILogger<SoulseekRadarService> logger, SoulseekClient soulseekClient, IConfiguration configuration)
         {
@@ -35,210 +34,219 @@ namespace Spotify.Slsk.Integration.Services
 
         public async Task DiscoverTracksAsync(string seedTrackQuery, string ssUsername, string ssPassword)
         {
-            _logger.LogInformation("Starting Soulseek-Radar discovery for seed: '{SeedTrackQuery}'", seedTrackQuery);
+            _logger.LogInformation("Starting Soulseek-Radar discovery for seed: '{Seed}'", seedTrackQuery);
 
             try
             {
-                _logger.LogDebug("Attempting Soulseek connect and login...");
+                // Connect & login
                 await SoulseekService.ConnectAndLoginAsync(_soulseekClient, ssUsername, ssPassword);
-                _logger.LogInformation("Soulseek connection and login successful.");
+                _logger.LogInformation("Connected and logged in.");
 
-                // --- Step 1: Foundation, Configuration & Seed Search ---
-                _logger.LogInformation("STEP 1: Performing initial Soulseek search for seed track (Timeout: {SearchTimeout}s)...", _options.SearchTimeoutSeconds);
-
-                IReadOnlyCollection<SearchResponse> responses;
-                try
-                {
-                    var searchResult = await _soulseekClient.SearchAsync(
-                        SearchQuery.FromText(seedTrackQuery),
-                        options: new SearchOptions(
+				// --- Step 1: Seed Search ---
+				_logger.LogInformation("STEP 1: Searching for '{Seed}' (timeout {T}s)", seedTrackQuery, _options.SearchTimeoutSeconds);
+				IReadOnlyCollection<SearchResponse> responses;
+				try
+				{
+					var searchResult = await _soulseekClient.SearchAsync(
+						SearchQuery.FromText(seedTrackQuery),
+						options: new SearchOptions(
 							searchTimeout: _options.SearchTimeoutSeconds * 1000,
-                            stateChanged: (e) => _logger.LogTrace("Search state changed: {State}", e.Search.State),
-                            responseReceived: (e) => _logger.LogTrace("Received response from {Username}", e.Response.Username)
-                        )
-                    );
-                    responses = searchResult.Responses;
-                    _logger.LogDebug("SearchAsync completed. State: {State}", searchResult.Search.State);
-                }
-                catch (OperationCanceledException ex) // Catch timeout from CancellationToken
-                {
-                    _logger.LogWarning(ex, "Soulseek search timed out after {Timeout} seconds for query: {Query}", _options.SearchTimeoutSeconds, seedTrackQuery);
-                    responses = new List<SearchResponse>(); // Ensure responses is not null
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "An error occurred during Soulseek search for query: {Query}", seedTrackQuery);
-                    throw; // Re-throw other search exceptions
-                }
+							stateChanged: e => _logger.LogTrace("Search state: {State}", e.Search.State),
+							responseReceived: e => _logger.LogTrace("Received response from {User}", e.Response.Username)
+						)
+					);
+					responses = searchResult.Responses;
+					_logger.LogDebug("SearchAsync completed. State: {State}", searchResult.Search.State);
+				}
+				catch (OperationCanceledException)
+				{
+					_logger.LogWarning("Search timed out after {T}s for '{Seed}'", _options.SearchTimeoutSeconds, seedTrackQuery);
+					responses = Array.Empty<SearchResponse>();
+				}
 
-                _logger.LogInformation("Initial search completed. Found {Count} total responses.", responses.Count);
-
-                // Filter for users with free slots first
-                var usersWithFreeSlots = responses
+                // Dedupe & free-slot filter
+                var uniqueUsers = responses
                     .Where(r => r.HasFreeUploadSlot)
-                    .ToList();
-
-                _logger.LogInformation("Found {Count} users with free upload slots.", usersWithFreeSlots.Count);
-
-                // Group by username to handle multiple responses from the same user
-                var uniqueUserResponses = usersWithFreeSlots
                     .GroupBy(r => r.Username)
-                    .Select(g => g.OrderByDescending(r => r.UploadSpeed).First()) // Pick one response per user
+                    .Select(g => g.OrderByDescending(r => r.UploadSpeed).First())
                     .ToList();
-
-                _logger.LogInformation("Identified {Count} unique users with free slots from search results.", uniqueUserResponses.Count);
-
-                if (!uniqueUserResponses.Any())
+                _logger.LogInformation("Found {Count} unique users with free slots.", uniqueUsers.Count);
+                if (!uniqueUsers.Any())
                 {
-                    _logger.LogWarning("No unique users found sharing '{SeedTrackQuery}' with free slots. Cannot proceed.", seedTrackQuery);
+                    _logger.LogWarning("No candidates; exiting.");
                     await DisconnectGracefullyAsync();
                     return;
                 }
 
-                _logger.LogInformation("--- Initial Unique User Candidates (Step 1) ---");
-                // Log initial candidates (FileCount here is still from the search response, not total share)
-                foreach (var user in uniqueUserResponses)
+                // --- Step 2: Stats & select ---
+                _logger.LogInformation("STEP 2: Fetching stats (timeout {T}s)...", _options.PerPeerTimeoutSeconds);
+                var shareData = new List<(string User,int Size)>();
+                foreach (var u in uniqueUsers.OrderByDescending(u => u.UploadSpeed).Take(_options.MaxUsers * 2))
                 {
-                    _logger.LogInformation("User: {Username} | Matching Files in Resp: {FileCount} | Avg Speed: {Speed} kB/s | Slots Free: {SlotsFree}",
-                        user.Username,
-                        user.Files.Count, // Log count of files *in this response* for clarity
-                        user.UploadSpeed,
-                        user.HasFreeUploadSlot);
-                }
-                _logger.LogInformation("--- End of Initial Candidates ---");
-                _logger.LogInformation("STEP 1 (Seed Search & Initial User Identification) complete.");
-                // --- End of Step 1 ---
-
-
-                // --- Step 2: User Selection (Share Size Bias) ---
-                _logger.LogInformation("STEP 2: Fetching user statistics and ranking by share size (Timeout per user: {Timeout}s)...", _options.PerPeerTimeoutSeconds);
-
-                var userShareData = new List<(string Username, int ShareSize)>();
-
-                // Limit the number of users we fetch stats for initially, e.g., top N fastest or just MaxUsers*2
-                // Taking MaxUsers*2 gives buffer for filtering
-                var candidatesToFetchStats = uniqueUserResponses
-                                                .OrderByDescending(u => u.UploadSpeed) // Prioritize faster users if we limit fetching
-                                                .Take(_options.MaxUsers * 2)
-                                                .ToList();
-
-                 _logger.LogInformation("Will attempt to fetch full statistics for up to {Count} candidates.", candidatesToFetchStats.Count);
-
-
-                foreach (var candidate in candidatesToFetchStats)
-                {
-                    _logger.LogDebug("Attempting to fetch statistics for user: {Username}", candidate.Username);
+                    _logger.LogDebug("Stats for {User}", u.Username);
                     try
                     {
-                        // Use a CancellationToken for the per-peer timeout for fetching stats
                         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
-                        UserStatistics userStats = await _soulseekClient.GetUserStatisticsAsync(candidate.Username, cts.Token);
-
-                        // Use the FileCount from the fetched statistics
-                        int totalFiles = userStats.FileCount; // Correct property is Files
-
-                        _logger.LogInformation("User: {Username} | Fetched Stats -> Files: {TotalFiles}",
-                            candidate.Username, totalFiles);
-
-                        if (totalFiles < MinShareSizeFiles)
-                        {
-                            _logger.LogInformation("Skipping user {Username} - Fetched share size ({TotalFiles} files) is less than {MinFiles}.",
-                                candidate.Username, totalFiles, MinShareSizeFiles);
-                            continue; // Skip user if share size is too small
-                        }
-
-                        // Add user and their actual share size to the list for ranking
-                        userShareData.Add((candidate.Username, totalFiles));
+                        var stats = await _soulseekClient.GetUserStatisticsAsync(u.Username, cts.Token);
+                        if (stats.FileCount >= MinShareSizeFiles)
+                            shareData.Add((u.Username, stats.FileCount));
                     }
-                    catch (OperationCanceledException) // Catches timeout from CancellationTokenSource
+                    catch (Exception ex)
                     {
-                        _logger.LogWarning("Timeout fetching statistics for user {Username} after {Timeout} seconds. Skipping.", candidate.Username, _options.PerPeerTimeoutSeconds);
-                    }
-                    catch (Exception ex) // Catch other unexpected errors
-                    {
-                        _logger.LogWarning(ex, "Failed to fetch statistics for user {Username}. Skipping.", candidate.Username);
+                        _logger.LogWarning(ex, "Skipping {User}", u.Username);
                     }
                 }
-
-                if (!userShareData.Any())
+                if (!shareData.Any())
                 {
-                    _logger.LogWarning("No suitable users found after fetching statistics and filtering by share size (minimum {MinFiles} files). Cannot proceed.", MinShareSizeFiles);
+                    _logger.LogWarning("No share-size qualifiers; exiting.");
                     await DisconnectGracefullyAsync();
                     return;
                 }
 
-                // Rank by smallest share size (ascending)
-                var rankedUsers = userShareData.OrderBy(u => u.ShareSize).ToList();
+                var selected = shareData.OrderBy(x => x.Size).Take(_options.MaxUsers).ToList();
+                _logger.LogInformation("Selected users: {Users}", selected.Select(x => x.User));
 
-                // Select the top MaxUsers according to the ranking
-                var selectedUsers = rankedUsers.Take(_options.MaxUsers).ToList();
+                // --- Step 3: Crawl & pick for first user ---
+                var firstUser = selected.First().User;
+                _logger.LogInformation("STEP 3: Crawling share of {User}", firstUser);
 
-                _logger.LogInformation("--- Selected Users (Step 2 - Ranked by Share Size <= {MaxUsers}) ---", _options.MaxUsers);
-                // Log the final selected list
-                int rank = 1;
-                foreach (var user in selectedUsers)
+                var browse = await _soulseekClient.BrowseAsync(firstUser);
+                _logger.LogDebug("Browse returned {D} dirs", browse.Directories.Count);
+
+                // raw seed-path from search result
+                var rawSeed = uniqueUsers.First(r => r.Username == firstUser).Files.First().Filename;
+                _logger.LogTrace("Raw seed path: '{Raw}'", rawSeed);
+
+                // trim @@* segments
+                var parts = rawSeed.Split('\\');
+                int ti = 0;
+                while (ti < parts.Length && parts[ti].StartsWith("@@"))
                 {
-                    _logger.LogInformation("#{Rank}. User: {Username} | Share Size (Fetched): {ShareSize} files",
-                         rank++, user.Username, user.ShareSize);
+                    _logger.LogTrace("Trimming '{S}'", parts[ti]);
+                    ti++;
                 }
-                 _logger.LogInformation("--- End of Selected Users ---");
-                 _logger.LogInformation("STEP 2 (User Selection by Share Size) complete.");
-                // --- End of Step 2 ---
+                var trimmed = parts.Skip(ti).ToArray();
+                var normPath = string.Join("\\", trimmed);
+                _logger.LogDebug("Normalized seed path: '{Norm}'", normPath);
 
+                // manual split on last backslash
+                int idx = normPath.LastIndexOf('\\');
+                string seedFolder = idx >= 0 ? normPath.Substring(0, idx) : "";
+                string seedFile   = idx >= 0 ? normPath[(idx + 1)..] : normPath;
+                _logger.LogDebug("SeedFolder='{F}', SeedFile='{f}'", seedFolder, seedFile);
 
-                // Placeholder for future steps
-                _logger.LogInformation("Further steps (Crawling, Downloading, Spotify Matching, etc.) are not yet implemented.");
-                var finalUsernames = selectedUsers.Select(u => u.Username).ToList();
-                // This list `finalUsernames` will be used in Step 3
+                // match any directory whose Name endsWith the seedFolder
+                var matches = browse.Directories
+                    .Where(d => d.Name.EndsWith(seedFolder, StringComparison.InvariantCultureIgnoreCase))
+                    .ToList();
+                _logger.LogDebug("Directories ending with '{F}': {C}", seedFolder, matches.Count);
 
+                if (!matches.Any())
+                {
+                    _logger.LogWarning("No directory matches '{F}'. Listing all:", seedFolder);
+                    foreach (var d in browse.Directories)
+                        _logger.LogWarning(" - '{Dir}'", d.Name);
+                }
+                else
+                {
+                    var dir = matches.First();
+                    var fileEntry = dir.Files.FirstOrDefault(f => f.Filename.Equals(seedFile, StringComparison.InvariantCultureIgnoreCase));
+                    if (fileEntry == null)
+                    {
+                        _logger.LogWarning("Could not find file '{f}' in directory '{F}'", seedFile, dir.Name);
+                    }
+                    else
+                    {
+                        // now pick sibling tracks
+                        var baseArtist = Normalize(dir.Name[(dir.Name.LastIndexOf('\\') + 1)..]);
+                        var allDirs = browse.Directories.ToList();
+                        var locked  = new HashSet<string>(browse.LockedDirectories.Select(x => x.Name));
+                        var picks   = new List<string>();
+                        var current = dir.Name;
+                        while (picks.Count < RecommendationsPerUser && current.Contains("\\"))
+                        {
+                            var parent = current[..current.LastIndexOf('\\')];
+                            _logger.LogTrace("Up to '{P}'", parent);
+
+                            var siblings = allDirs.Select(d => d.Name)
+                                .Where(p =>
+                                    p.StartsWith(parent + "\\") &&
+                                    p.LastIndexOf('\\') == parent.Length)
+                                .Except(locked)
+                                .Except(new[] { current })
+                                .ToList();
+                            Shuffle(siblings);
+
+                            foreach (var s in siblings)
+                            {
+                                var art = Normalize(s[(s.LastIndexOf('\\') + 1)..]);
+                                if (art == baseArtist) continue;
+
+                                var dobj = allDirs.Single(d => d.Name == s);
+                                var cands = dobj.Files
+                                    .Where(f => f.Size > 0)
+                                    .Select(f => $"{s}\\{f.Filename}")
+                                    .Where(path =>
+                                    {
+                                        var ext = Path.GetExtension(path)?.ToLowerInvariant();
+                                        return ext is ".mp3" or ".flac" or ".m4a" or ".ogg";
+                                    })
+                                    .ToList();
+
+                                if (cands.Any())
+                                {
+                                    var pick = cands[new Random().Next(cands.Count)];
+                                    picks.Add(pick);
+                                    _logger.LogInformation("Picked '{Pick}'", pick);
+                                    if (picks.Count == RecommendationsPerUser) break;
+                                }
+                            }
+
+                            current = parent;
+                        }
+
+                        _logger.LogInformation("STEP 3 picks for {U}: {Count} → {List}",
+                            firstUser, picks.Count, picks);
+                    }
+                }
+
+                _logger.LogInformation("Done.");
             }
-            catch (LoginRejectedException ex)
+            catch (Exception ex)
             {
-                 _logger.LogError(ex, "Soulseek login failed for user '{Username}'. Reason: {Reason}", ssUsername, ex.Message);
-            }
-            catch (ConnectionException ex)
-            {
-                 _logger.LogError(ex, "Soulseek connection failed. Reason: {Reason}", ex.Message);
-            }
-            catch (Exception ex) // General catch-all for the whole process
-            {
-                _logger.LogError(ex, "An unexpected error occurred during Soulseek-Radar discovery for seed '{SeedTrackQuery}'", seedTrackQuery);
+                _logger.LogError(ex, "Discovery error");
             }
             finally
             {
-                 // Ensure disconnection even if errors occur
-                 await DisconnectGracefullyAsync();
+                await DisconnectGracefullyAsync();
             }
         }
 
-        // Helper method for graceful disconnection
         private async Task DisconnectGracefullyAsync()
         {
-            if (_soulseekClient != null && _soulseekClient.State != SoulseekClientStates.Disconnected)
+            if (_soulseekClient?.State != SoulseekClientStates.Disconnected)
             {
-                _logger.LogInformation("Disconnecting from Soulseek server...");
-                try
-                {
-                    _soulseekClient.Disconnect();
-                    _logger.LogInformation("Successfully disconnected from Soulseek.");
-                }
-                catch (OperationCanceledException)
-                {
-                     _logger.LogWarning("Soulseek disconnection timed out after 5 seconds.");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Error during Soulseek disconnection.");
-                }
+                _logger.LogInformation("Disconnecting...");
+                _soulseekClient.Disconnect();
+                _logger.LogInformation("Disconnected.");
             }
         }
 
+        private static string Normalize(string s) =>
+            (s ?? "")
+            .Replace('_','-')
+            .ToLowerInvariant()
+            .Split(new[]{' ','-'},StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault() ?? "";
 
-        // Placeholder - Will be implemented in later steps
-        private async Task CreateOrUpdateSpotifyPlaylist(string seedTitle, List<string> trackUris)
+        private static void Shuffle<T>(IList<T> list)
         {
-            _logger.LogInformation("Placeholder: Would create/update Spotify playlist here.");
-            await Task.CompletedTask;
+            var rnd = new Random();
+            for (int i = list.Count - 1; i > 0; i--)
+            {
+                int j = rnd.Next(i + 1);
+                (list[i], list[j]) = (list[j], list[i]);
+            }
         }
     }
 }
