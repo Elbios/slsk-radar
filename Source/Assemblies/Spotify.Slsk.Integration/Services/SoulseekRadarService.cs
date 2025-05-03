@@ -15,6 +15,7 @@ using System.IO;
 using System.Collections.Concurrent;
 using TagLib; // Added for ID3 tags
 using System.Diagnostics; // For Stopwatch if needed, though Transfer object has timing
+using System.Text.RegularExpressions; // Added for Regex preprocessing
 
 namespace Spotify.Slsk.Integration.Services
 {
@@ -27,9 +28,15 @@ namespace Spotify.Slsk.Integration.Services
 		// Define the Soulseek path separator explicitly
 		private const char SoulseekSeparator = '\\';
         private const int MinShareSizeFiles = 50;
+        // *** CHANGE 2: Define Max Share Size ***
+        private const int MaxShareSizeFiles = 700000;
         // Similarity threshold for fuzzy matching (lower means MORE dissimilar items are picked)
         private const int SimilarityThreshold = 53;
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string> { ".mp3", ".flac", ".m4a", ".ogg" };
+
+        // *** CHANGE 1: Regex for preprocessing ***
+        private static readonly Regex ParenthesesContentRegex = new Regex(@"\[.*?\]|\(.*?\)", RegexOptions.Compiled);
+        private static readonly Regex DigitWordRegex = new Regex(@"\b\d+\b", RegexOptions.Compiled);
 
         public SoulseekRadarService(
             ILogger<SoulseekRadarService> logger,
@@ -106,7 +113,6 @@ namespace Spotify.Slsk.Integration.Services
 
 
                 // --- Step 2: Fetch stats & select users ---
-                // ... (Step 2 logic remains the same) ...
                  _logger.LogInformation("STEP 2: Fetching stats for up to {MaxCheck} users (timeout {T}s per user)...", _options.MaxUsers * 2, _options.PerPeerTimeoutSeconds);
                 var shareData = new List<(string Username, int FileCount)>();
                 var usersToCheck = uniqueUsers.OrderByDescending(u => u.UploadSpeed).Take(Math.Min(uniqueUsers.Count, _options.MaxUsers * 2)).ToList();
@@ -120,8 +126,16 @@ namespace Spotify.Slsk.Integration.Services
                         using var statsCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
                         statsCts.CancelAfter(TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
                         var stats = await _soulseekClient.GetUserStatisticsAsync(resp.Username, statsCts.Token);
-                        // *** ADDED: Log total file count ***
                         _logger.LogDebug(" -> User {User} has {TotalFiles} total files in share.", resp.Username, stats.FileCount);
+
+                        // *** CHANGE 2: Skip users with excessive share size ***
+                        if (stats.FileCount >= MaxShareSizeFiles)
+                        {
+                            _logger.LogInformation(" -> Skipping {User}, share size ({Count}) exceeds limit ({Limit}).", resp.Username, stats.FileCount, MaxShareSizeFiles);
+                            continue; // Skip to the next user
+                        }
+                        // *** END CHANGE 2 ***
+
                         if (stats.FileCount >= MinShareSizeFiles)
                         {
                             shareData.Add((resp.Username, stats.FileCount));
@@ -137,7 +151,8 @@ namespace Spotify.Slsk.Integration.Services
                     catch (Exception ex) { _logger.LogError(ex, " -> Unexpected error fetching stats for {User}", resp.Username); }
                 }
                 if (overallCts.IsCancellationRequested) { _logger.LogWarning("Operation cancelled during user stats fetching."); await DisconnectGracefullyAsync(); return; }
-                if (!shareData.Any()) { _logger.LogWarning("No users passed the share-size filter ({MinFiles} files). Exiting.", MinShareSizeFiles); await DisconnectGracefullyAsync(); return; }
+                // *** CHANGE 2: Adjusted log message slightly for clarity ***
+                if (!shareData.Any()) { _logger.LogWarning("No users passed the share-size filters (min: {MinFiles}, max: {MaxFiles}). Exiting.", MinShareSizeFiles, MaxShareSizeFiles); await DisconnectGracefullyAsync(); return; }
 
                 var selectedUsers = shareData.OrderBy(x => x.FileCount).Take(_options.MaxUsers).Select(x => x.Username).ToList();
                 _logger.LogInformation("Selected {Count} users for crawling: {Users}", selectedUsers.Count, string.Join(", ", selectedUsers));
@@ -146,7 +161,6 @@ namespace Spotify.Slsk.Integration.Services
 
 
                 // --- Step 3: Crawl & pick recommendations ---
-                // ... (Step 3 logic remains the same, uses CrawlAndPickAsync below) ...
 				_logger.LogInformation("STEP 3: Crawling shares and picking up to {N} potential tracks per user", perUserQuota);
 				var allPotentialDownloads = new List<(string Username, string RemoteFilePath)>();
 				foreach (var user in selectedUsers)
@@ -206,6 +220,7 @@ namespace Spotify.Slsk.Integration.Services
 
 
                 // --- Step 4: Parallel Harvesting & Metadata Extraction ---
+                // ... (Step 4 logic remains the same) ...
                 _logger.LogInformation("STEP 4: Starting parallel download and metadata extraction...");
                 _logger.LogInformation(" -> Global Concurrency Limit: {Limit}", _options.GlobalDownloadConcurrency);
                 _logger.LogInformation(" -> Per-User Success Quota (incl. ID3): {Quota}", perUserQuota); // Clarified quota meaning
@@ -547,10 +562,12 @@ namespace Spotify.Slsk.Integration.Services
         var seedFileNameOnly = GetFileNameManual(seedPath);
         var seedParentDir = GetParentPathManual(seedPath);
         var seedFileNameWithoutExtension = GetFileNameWithoutExtensionManual(seedFileNameOnly);
-        var normalizedSeedFileNameForMatch = Normalize(seedFileNameWithoutExtension);
+        // *** CHANGE 1: Use the enhanced Normalize function ***
+        var preprocessedSeedFileName = PreprocessForFuzzyMatch(seedFileNameWithoutExtension);
 
         _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir);
-        _logger.LogDebug(" -> Seed Filename for Matching (Normalized): '{NormSeedFile}'", normalizedSeedFileNameForMatch);
+        // *** CHANGE 1: Log the preprocessed seed name ***
+        _logger.LogDebug(" -> Seed Filename for Matching (Preprocessed): '{PreprocessedSeedFile}'", preprocessedSeedFileName);
 
         if (string.IsNullOrEmpty(seedParentDir))
         {
@@ -562,9 +579,17 @@ namespace Spotify.Slsk.Integration.Services
                 .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
                          && IsAllowedExtension(f.Filename)
                          && f.Size > 0 && f.Size <= fileSizeCapBytes)
-                .Select(f => new { FullPath = f.Filename, NormalizedName = Normalize(GetFileNameWithoutExtensionManual(GetFileNameManual(f.Filename))) })
-                // *** Use TokenSetRatio for fallback comparison too ***
-                .Select(f => new { f.FullPath, Similarity = Fuzz.TokenSetRatio(f.NormalizedName, normalizedSeedFileNameForMatch) })
+                // *** CHANGE 1: Preprocess candidate file names and check for empty strings ***
+                .Select(f => new {
+                    FullPath = f.Filename,
+                    PreprocessedName = PreprocessForFuzzyMatch(GetFileNameWithoutExtensionManual(GetFileNameManual(f.Filename)))
+                 })
+                .Select(f => new {
+                    f.FullPath,
+                    Similarity = (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(f.PreprocessedName))
+                                    ? 0 // Force dissimilarity if preprocessing results in empty string
+                                    : Fuzz.TokenSetRatio(preprocessedSeedFileName, f.PreprocessedName)
+                })
                 .Where(f => f.Similarity < SimilarityThreshold)
                 .OrderBy(f => f.Similarity) // Optional: maybe pick the least similar ones first? Or random?
                 .Take(maxPicks)
@@ -572,7 +597,7 @@ namespace Spotify.Slsk.Integration.Services
                 .ToList();
 
              if (fallbackPicks.Any()) {
-                 _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}% using TokenSetRatio):",
+                 _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}% using TokenSetRatio with preprocessing):",
                     fallbackPicks.Count, maxPicks, SimilarityThreshold);
                  foreach(var pick in fallbackPicks) {
                      // We don't have the similarity score here easily without more refactoring, so just log the path
@@ -580,7 +605,7 @@ namespace Spotify.Slsk.Integration.Services
                      picks.Add(pick);
                  }
              } else {
-                 _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}% using TokenSetRatio).", SimilarityThreshold);
+                 _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}% using TokenSetRatio with preprocessing).", SimilarityThreshold);
              }
              return picks;
         }
@@ -634,28 +659,38 @@ namespace Spotify.Slsk.Integration.Services
                     var fullPath = file.Filename;
                     var currentFileNameOnly = GetFileNameManual(fullPath);
                     var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
-                    var normalizedCurrentFileName = Normalize(currentFileNameWithoutExtension);
+                    // *** CHANGE 1: Preprocess current file name ***
+                    var preprocessedCurrentFileName = PreprocessForFuzzyMatch(currentFileNameWithoutExtension);
 
-                    // *** USE TokenSetRatio FOR FILES ***
-                    int fileSimilarity = Fuzz.TokenSetRatio(normalizedCurrentFileName, normalizedSeedFileNameForMatch);
+                    // *** CHANGE 1: Calculate similarity using preprocessed names & check for empty strings ***
+                    int fileSimilarity;
+                    if (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedCurrentFileName))
+                    {
+                        fileSimilarity = 0; // Treat as dissimilar if preprocessing empties a string
+                        _logger.LogTrace(" -> Preprocessing resulted in empty string for file '{FileName}' or seed. Forcing dissimilarity.", currentFileNameOnly);
+                    }
+                    else
+                    {
+                        fileSimilarity = Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedCurrentFileName);
+                    }
 
-                    // *** Log actual file similarity score ***
-                    _logger.LogTrace(" -> Checking file: '{FileName}' (Normalized: '{NormFile}') vs Seed (Normalized: '{NormSeed}'). TokenSetRatio: {Score}%",
-                        currentFileNameOnly, normalizedCurrentFileName, normalizedSeedFileNameForMatch, fileSimilarity);
+                    // Log actual file similarity score
+                    _logger.LogTrace(" -> Checking file: '{FileName}' (Preprocessed: '{PreprocessedFile}') vs Seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Score}%",
+                        currentFileNameOnly, preprocessedCurrentFileName, preprocessedSeedFileName, fileSimilarity);
 
                     if (fileSimilarity < SimilarityThreshold)
                     {
                         picks.Add(fullPath);
                         pickedFromFileInDir.Add(currentDir);
                         pickedThisDir = true;
-                        _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedNorm}': {Score}% < {Threshold}%)",
-                            currentFileNameOnly, normalizedSeedFileNameForMatch, fileSimilarity, SimilarityThreshold);
+                        _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedPreprocessed}': {Score}% < {Threshold}%)",
+                            currentFileNameOnly, preprocessedSeedFileName, fileSimilarity, SimilarityThreshold);
                         _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
                         break; // Stop after one pick per directory
                     }
                     else
                     {
-                        // *** ADDED: Log skipped files due to similarity ***
+                        // ADDED: Log skipped files due to similarity
                         _logger.LogTrace(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)",
                             currentFileNameOnly, fileSimilarity, SimilarityThreshold);
                     }
@@ -698,28 +733,38 @@ namespace Spotify.Slsk.Integration.Services
                 }
 
                 var childDirNameOnly = GetLastPathComponentManual(childDir);
-                var normalizedChildDirName = Normalize(childDirNameOnly);
+                // *** CHANGE 1: Preprocess child dir name ***
+                var preprocessedChildDirName = PreprocessForFuzzyMatch(childDirNameOnly);
 
-                // *** USE TokenSetRatio FOR DIRECTORIES ***
-                var similarity = Fuzz.TokenSetRatio(normalizedChildDirName, normalizedSeedFileNameForMatch);
+                // *** CHANGE 1: Calculate similarity using preprocessed names & check for empty strings ***
+                int similarity;
+                if (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedChildDirName))
+                {
+                    similarity = 0; // Treat as dissimilar if preprocessing empties a string
+                    _logger.LogTrace(" -> Preprocessing resulted in empty string for dir '{DirName}' or seed. Forcing dissimilarity.", childDirNameOnly);
+                }
+                else
+                {
+                    similarity = Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedChildDirName);
+                }
 
-                // *** Log actual directory similarity score ***
-                _logger.LogTrace("Checking child dir '{ChildName}' (Normalized: '{NormChild}') against seed (Normalized: '{NormSeed}'). TokenSetRatio: {Similarity}%",
-                    childDirNameOnly, normalizedChildDirName, normalizedSeedFileNameForMatch, similarity);
+                // Log actual directory similarity score
+                _logger.LogTrace("Checking child dir '{ChildName}' (Preprocessed: '{PreprocessedChild}') against seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Similarity}%",
+                    childDirNameOnly, preprocessedChildDirName, preprocessedSeedFileName, similarity);
 
                 if (similarity >= SimilarityThreshold)
                 {
                     // Similar child found - log it, mark visited, and CONTINUE to the next child.
-                    // *** ADDED: Log ratio vs threshold explicitly ***
-                    _logger.LogDebug("Child directory '{ChildName}' is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed (Normalized: '{NormSeed}'). Marking visited, skipping descent.",
-                         childDirNameOnly, similarity, SimilarityThreshold, normalizedSeedFileNameForMatch);
+                    // ADDED: Log ratio vs threshold explicitly
+                    _logger.LogDebug("Child directory '{ChildName}' is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed (Preprocessed: '{PreprocessedSeed}'). Marking visited, skipping descent.",
+                         childDirNameOnly, similarity, SimilarityThreshold, preprocessedSeedFileName);
                     visitedDirs.Add(childDir);
                     // Continue to the next child in the foreach loop
                 }
                 else
                 {
                     // Dissimilar child found - add it to the list for potential pushing later.
-                    // *** ADDED: Log ratio vs threshold explicitly ***
+                    // ADDED: Log ratio vs threshold explicitly
                      _logger.LogTrace("Child directory '{ChildName}' is DISSIMILAR (TokenSetRatio: {Similarity}% < {Threshold}%). Adding to potential exploration list.", childDirNameOnly, similarity, SimilarityThreshold);
                     dissimilarChildrenToPush.Add(childDir);
                 }
@@ -805,16 +850,41 @@ namespace Spotify.Slsk.Integration.Services
                 }
             }
         }
+
+    // *** CHANGE 1: Updated PreprocessForFuzzyMatch method ***
     /// <summary>
-    /// Normalizes a string for fuzzy matching (lowercase, simplified whitespace/punctuation).
+    /// Preprocesses a string for fuzzy matching:
+    /// - Converts to lowercase.
+    /// - Removes content within parentheses () or square brackets [].
+    /// - Removes standalone words consisting entirely of digits.
+    /// - Removes dots (.).
+    /// - Normalizes whitespace (collapses multiple spaces, trims).
     /// </summary>
-    private static string Normalize(string s)
+    /// <param name="s">The input string.</param>
+    /// <returns>The preprocessed string, or an empty string if the input was null/whitespace.</returns>
+    private static string PreprocessForFuzzyMatch(string? s)
     {
         if (string.IsNullOrWhiteSpace(s)) return "";
-        // Keep the existing normalization logic
-        var normalized = System.Text.RegularExpressions.Regex.Replace(s.ToLowerInvariant(), @"[\s\(\)\[\]\{\}\.\,\-_]+", " ").Trim();
-        return normalized;
+
+        string processed = s.ToLowerInvariant();
+
+        // Remove content within () and []
+        processed = ParenthesesContentRegex.Replace(processed, "");
+
+        // Remove standalone words consisting entirely of digits
+        processed = DigitWordRegex.Replace(processed, "");
+
+        // Remove dots
+        processed = processed.Replace(".", "");
+
+        // Normalize whitespace (replace multiple spaces/tabs/etc with single space, trim)
+        processed = Regex.Replace(processed, @"\s+", " ").Trim();
+
+        return processed;
     }
+
+    // Note: The old Normalize method is effectively replaced by PreprocessForFuzzyMatch above.
+    // The calls to Normalize in CrawlAndPickAsync have been updated.
 
     /// <summary>
     /// Checks if a filename has an allowed audio extension.
@@ -923,47 +993,16 @@ namespace Spotify.Slsk.Integration.Services
         }
         return false;
     }
-	
-	/*
-        // --- Helper Methods --- (Keep existing ones)
-		private static string Normalize(string s)
-		{
-			if (string.IsNullOrWhiteSpace(s)) return "";
-			// Keep the existing normalization logic
-			var normalized = System.Text.RegularExpressions.Regex.Replace(s.ToLowerInvariant(), @"[\s\(\)\[\]\{\}\.\,\-_]+", " ").Trim();
-			return normalized;
-		}
 
-		private static bool IsAllowedExtension(string filename)
-		{
-			if (string.IsNullOrEmpty(filename)) return false;
-			var ext = Path.GetExtension(filename)?.ToLowerInvariant();
-			return !string.IsNullOrEmpty(ext) && AllowedExtensions.Contains(ext);
-		}
-
-		private void Shuffle<T>(IList<T> list)
-		{
-			int n = list.Count;
-			while (n > 1) { n--; int k = _random.Next(n + 1); (list[k], list[n]) = (list[n], list[k]); }
-		}
-
-		// Assuming Soulseek paths use '\'. If they use '/', this needs adjustment.
-		private static string? GetParentPath(string? path)
-		{
-			if (string.IsNullOrEmpty(path)) return null;
-			int idx = path.LastIndexOf('\\'); // Use the separator defined earlier
-			// Handle edge case: path like "C:\" or just "\"
-			if (idx <= 0) return null; // Root or single component
-			return path.Substring(0, idx);
-		}
-
-		// Assuming Soulseek paths use '\'.
-		private static string GetLastPathComponent(string? path)
-		{
-			if (string.IsNullOrEmpty(path)) return "";
-			int idx = path.LastIndexOf('\\'); // Use the separator defined earlier
-			return path.Substring(idx + 1);
-		}*/
+    /*
+        // --- Helper Methods --- (Old/Removed Helpers commented out for reference)
+		// private static string Normalize(string s) // Replaced by PreprocessForFuzzyMatch
+		// { ... }
+		// private static string? GetParentPath(string? path) // Replaced by Manual version
+		// { ... }
+		// private static string GetLastPathComponent(string? path) // Replaced by Manual version
+		// { ... }
+	*/
 
     } // End SoulseekRadarService Class
 } // End Namespace
