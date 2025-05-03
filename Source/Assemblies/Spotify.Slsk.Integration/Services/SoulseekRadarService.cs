@@ -27,6 +27,7 @@ namespace Spotify.Slsk.Integration.Services
 		// Define the Soulseek path separator explicitly
 		private const char SoulseekSeparator = '\\';
         private const int MinShareSizeFiles = 50;
+        // Similarity threshold for fuzzy matching (lower means MORE dissimilar items are picked)
         private const int SimilarityThreshold = 53;
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string> { ".mp3", ".flac", ".m4a", ".ogg" };
 
@@ -119,14 +120,16 @@ namespace Spotify.Slsk.Integration.Services
                         using var statsCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
                         statsCts.CancelAfter(TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
                         var stats = await _soulseekClient.GetUserStatisticsAsync(resp.Username, statsCts.Token);
+                        // *** ADDED: Log total file count ***
+                        _logger.LogDebug(" -> User {User} has {TotalFiles} total files in share.", resp.Username, stats.FileCount);
                         if (stats.FileCount >= MinShareSizeFiles)
                         {
                             shareData.Add((resp.Username, stats.FileCount));
-                            _logger.LogTrace(" -> {User} has {Count} files (>= {Min})", resp.Username, stats.FileCount, MinShareSizeFiles);
+                            _logger.LogTrace(" -> {User} meets minimum share size ({Count} >= {Min})", resp.Username, stats.FileCount, MinShareSizeFiles);
                         }
                         else
                         {
-                            _logger.LogTrace(" -> Skipping {User}, only {Count} files", resp.Username, stats.FileCount);
+                            _logger.LogTrace(" -> Skipping {User}, only {Count} files (less than {Min})", resp.Username, stats.FileCount, MinShareSizeFiles);
                         }
                     }
                     catch (OperationCanceledException) when (!overallCts.IsCancellationRequested) { _logger.LogWarning(" -> Timeout fetching stats for {User}", resp.Username); }
@@ -149,7 +152,7 @@ namespace Spotify.Slsk.Integration.Services
 				foreach (var user in selectedUsers)
 				{
 					if (overallCts.IsCancellationRequested) break;
-					_logger.LogInformation("Processing user {User}...", user);
+					_logger.LogInformation("===> Processing user {User}...", user); // Matched log format
 					var seedResp = uniqueUsers.FirstOrDefault(r => r.Username == user);
 					// Ensure we have *at least one* file entry in the response to get a seed path
 					if (seedResp == null || !seedResp.Files.Any())
@@ -477,7 +480,7 @@ namespace Spotify.Slsk.Integration.Services
             }
         } // End DiscoverTracksAsync
 
-/// <summary>
+    /// <summary>
     /// Crawls a user's share starting from a seed track's location, picking related but different tracks.
     /// Picks at most ONE track per directory.
     /// Uses fuzzy matching (TokenSetRatio) between directory/file names and the seed track's filename
@@ -645,12 +648,17 @@ namespace Spotify.Slsk.Integration.Services
                         picks.Add(fullPath);
                         pickedFromFileInDir.Add(currentDir);
                         pickedThisDir = true;
-                        _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedNorm}': {Score}%)",
-                            currentFileNameOnly, normalizedSeedFileNameForMatch, fileSimilarity);
+                        _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedNorm}': {Score}% < {Threshold}%)",
+                            currentFileNameOnly, normalizedSeedFileNameForMatch, fileSimilarity, SimilarityThreshold);
                         _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
                         break; // Stop after one pick per directory
                     }
-                    // No need for an else log here, the Trace log above covers skipped files implicitly
+                    else
+                    {
+                        // *** ADDED: Log skipped files due to similarity ***
+                        _logger.LogTrace(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)",
+                            currentFileNameOnly, fileSimilarity, SimilarityThreshold);
+                    }
                 }
                 _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file? {PickedStatus}", currentDir, pickedThisDir);
 
@@ -702,7 +710,8 @@ namespace Spotify.Slsk.Integration.Services
                 if (similarity >= SimilarityThreshold)
                 {
                     // Similar child found - log it, mark visited, and CONTINUE to the next child.
-                    _logger.LogDebug("Child directory '{ChildName}' is SIMILAR (TokenSetRatio: {Similarity} >= {Threshold}) to seed (Normalized: '{NormSeed}'). Marking visited, skipping descent.",
+                    // *** ADDED: Log ratio vs threshold explicitly ***
+                    _logger.LogDebug("Child directory '{ChildName}' is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed (Normalized: '{NormSeed}'). Marking visited, skipping descent.",
                          childDirNameOnly, similarity, SimilarityThreshold, normalizedSeedFileNameForMatch);
                     visitedDirs.Add(childDir);
                     // Continue to the next child in the foreach loop
@@ -710,7 +719,8 @@ namespace Spotify.Slsk.Integration.Services
                 else
                 {
                     // Dissimilar child found - add it to the list for potential pushing later.
-                     _logger.LogTrace("Child directory '{ChildName}' is DISSIMILAR (TokenSetRatio: {Similarity} < {Threshold}). Adding to potential exploration list.", childDirNameOnly, similarity, SimilarityThreshold);
+                    // *** ADDED: Log ratio vs threshold explicitly ***
+                     _logger.LogTrace("Child directory '{ChildName}' is DISSIMILAR (TokenSetRatio: {Similarity}% < {Threshold}%). Adding to potential exploration list.", childDirNameOnly, similarity, SimilarityThreshold);
                     dissimilarChildrenToPush.Add(childDir);
                 }
             } // --- End foreach childDir ---
