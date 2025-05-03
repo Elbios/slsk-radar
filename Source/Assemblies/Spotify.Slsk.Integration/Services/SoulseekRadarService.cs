@@ -24,9 +24,10 @@ namespace Spotify.Slsk.Integration.Services
         private readonly SoulseekClient _soulseekClient;
         private readonly SoulseekRadarOptions _options;
         private readonly Random _random = new Random();
-
+		// Define the Soulseek path separator explicitly
+		private const char SoulseekSeparator = '\\';
         private const int MinShareSizeFiles = 50;
-        private const int SimilarityThreshold = 50;
+        private const int SimilarityThreshold = 53;
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string> { ".mp3", ".flac", ".m4a", ".ogg" };
 
         public SoulseekRadarService(
@@ -143,26 +144,59 @@ namespace Spotify.Slsk.Integration.Services
 
                 // --- Step 3: Crawl & pick recommendations ---
                 // ... (Step 3 logic remains the same, uses CrawlAndPickAsync below) ...
-                 _logger.LogInformation("STEP 3: Crawling shares and picking up to {N} potential tracks per user", perUserQuota);
-                var allPotentialDownloads = new List<(string Username, string RemoteFilePath)>();
-                foreach (var user in selectedUsers)
-                {
-                    if (overallCts.IsCancellationRequested) break;
-                    _logger.LogInformation("Processing user {User}...", user);
-                    var seedResp = uniqueUsers.FirstOrDefault(r => r.Username == user);
-                    if (seedResp == null || !seedResp.Files.Any()) { _logger.LogWarning("Could not find original search response or files for user {User}. Skipping crawl.", user); continue; }
-                    List<string> picks;
-                    try
-                    {
-                        using var crawlCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
-                        crawlCts.CancelAfter(TimeSpan.FromSeconds(_options.CrawlTimeoutSeconds));
-                        picks = await CrawlAndPickAsync(user, seedResp, perUserQuota, crawlCts.Token);
-                    }
-                    catch (OperationCanceledException) when (!overallCts.IsCancellationRequested) { _logger.LogWarning("Timeout during crawl for {User}", user); continue; }
-                    catch (Exception ex) { _logger.LogWarning(ex, "Error during crawl for {User}", user); continue; }
-                    if (picks.Any()) { allPotentialDownloads.AddRange(picks.Select(p => (user, p))); _logger.LogInformation(" -> Found {Count} potential picks for {User}: {Picks}", picks.Count, user, string.Join("; ", picks.Select(p => Path.GetFileName(p)))); }
-                    else { _logger.LogInformation(" -> Found no suitable picks for {User}", user); }
-                }
+				_logger.LogInformation("STEP 3: Crawling shares and picking up to {N} potential tracks per user", perUserQuota);
+				var allPotentialDownloads = new List<(string Username, string RemoteFilePath)>();
+				foreach (var user in selectedUsers)
+				{
+					if (overallCts.IsCancellationRequested) break;
+					_logger.LogInformation("Processing user {User}...", user);
+					var seedResp = uniqueUsers.FirstOrDefault(r => r.Username == user);
+					// Ensure we have *at least one* file entry in the response to get a seed path
+					if (seedResp == null || !seedResp.Files.Any())
+					{
+						_logger.LogWarning("Could not find original search response or files for user {User}. Skipping crawl.", user);
+						continue;
+					}
+					// Pass the *first* file from the response as the seed context
+					var seedFileEntry = seedResp.Files.First();
+
+					List<string> picks;
+					using var crawlCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
+					try
+					{
+						// Use CrawlTimeoutSeconds for the overall crawl operation for this user
+						crawlCts.CancelAfter(TimeSpan.FromSeconds(_options.CrawlTimeoutSeconds));
+
+						// Pass the specific seed file entry
+						picks = await CrawlAndPickAsync(user, seedFileEntry, perUserQuota, crawlCts.Token);
+					}
+					catch (OperationCanceledException) when (!overallCts.IsCancellationRequested && crawlCts.IsCancellationRequested)
+					{
+						// Log specifically if the crawl timeout was hit
+						_logger.LogWarning("Timeout ({Timeout}s) during crawl for {User}", _options.CrawlTimeoutSeconds, user);
+						continue;
+					}
+					catch (OperationCanceledException) when (overallCts.IsCancellationRequested)
+					{
+						// Log if the overall operation was cancelled during crawl
+						_logger.LogWarning("Crawl cancelled (overall operation) for {User}", user);
+						break; // Break the user loop
+					}
+					catch (Exception ex)
+					{
+						_logger.LogWarning(ex, "Error during crawl for {User}", user);
+						continue;
+					}
+					if (picks.Any())
+					{
+						allPotentialDownloads.AddRange(picks.Select(p => (user, p)));
+						_logger.LogInformation(" -> Found {Count} potential picks for {User}: {Picks}", picks.Count, user, string.Join("; ", picks.Select(p => Path.GetFileName(p))));
+					}
+					else
+					{
+						_logger.LogInformation(" -> Found no suitable picks for {User}", user);
+					}
+				}
                 if (overallCts.IsCancellationRequested) { _logger.LogWarning("Operation cancelled during user share crawling."); await DisconnectGracefullyAsync(); return; }
                 _logger.LogInformation("Step 3 complete. Total potential downloads identified: {Total}", allPotentialDownloads.Count);
                 if (!allPotentialDownloads.Any()) { _logger.LogWarning("No potential tracks identified across all selected users. Exiting."); await DisconnectGracefullyAsync(); return; }
@@ -443,101 +477,299 @@ namespace Spotify.Slsk.Integration.Services
             }
         } // End DiscoverTracksAsync
 
-        // --- Step 3 Method --- (Keep existing, ensure it uses options correctly)
-        private async Task<List<string>> CrawlAndPickAsync(
-            string username,
-            SearchResponse seedResp,
-            int maxPicks,
-            CancellationToken cancellationToken)
+/// <summary>
+    /// Crawls a user's share starting from a seed track's location, picking related but different tracks.
+    /// Picks at most ONE track per directory.
+    /// Uses fuzzy matching (TokenSetRatio) between directory/file names and the seed track's filename
+    /// (without extension or path) to guide exploration and avoid duplicates.
+    /// Relies on manual path parsing using backslash as separator.
+    /// It explores dissimilar child directories first. If a directory only contains similar children (or already visited ones),
+    /// or has no children, it attempts to move up the hierarchy.
+    /// </summary>
+    /// <param name="username">The user whose share to crawl.</param>
+    /// <param name="seedFileEntry">The specific file entry from the initial search result representing the seed track.</param>
+    /// <param name="maxPicks">The maximum number of track paths to pick (overall).</param>
+    /// <param name="cancellationToken">Cancellation token for the crawl operation.</param>
+    /// <returns>A list of full remote file paths for potential download.</returns>
+    private async Task<List<string>> CrawlAndPickAsync(
+        string username,
+        Soulseek.File seedFileEntry, // Specific File entry
+        int maxPicks,       // Overall quota
+        CancellationToken cancellationToken)
+    {
+        var picks = new List<string>();
+        const char Sep = SoulseekSeparator;
+
+        _logger.LogDebug("Browsing share for {User} (seeking {MaxPicks} picks total, 1 per dir, timeout {T}s for browse, threshold {Threshold}%)",
+            username, maxPicks, _options.PerPeerTimeoutSeconds, SimilarityThreshold); // Log threshold
+        BrowseResponse browse;
+        try
         {
-            var picks = new List<string>();
-            const char Sep = '\\';
-
-            _logger.LogDebug("Browsing share for {User} (seeking {MaxPicks} picks, timeout {T}s)", username, maxPicks, _options.PerPeerTimeoutSeconds); // Use PerPeerTimeout for browse
-            BrowseResponse browse;
-            try
-            {
-                 // Use PerPeerTimeoutSeconds for the browse operation itself
-                 browse = await _soulseekClient.BrowseAsync(username,
-                    new BrowseOptions(responseTimeout: _options.PerPeerTimeoutSeconds * 1000),
-                    cancellationToken);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                 _logger.LogWarning("Timeout browsing share for {User} after {T}s", username, _options.CrawlTimeoutSeconds); // Log CrawlTimeout here
-                 return picks;
-            }
-            catch (Exception ex) when (ex is UserOfflineException || ex is TimeoutException || ex is SoulseekClientException)
-            {
-                 _logger.LogWarning("Failed to browse share for {User}: {Msg}", username, ex.Message);
-                 return picks;
-            }
-
-            long fileSizeCapBytes = (long)_options.FileSizeCapMB * 1024 * 1024;
-
-            var allDirs = browse.Directories
-                .Where(d => d.Files.Any(f => IsAllowedExtension(f.Filename) && f.Size > 0 && f.Size <= fileSizeCapBytes))
-                .ToDictionary(d => d.Name, d => d);
-
-            var locked = new HashSet<string>(browse.LockedDirectories.Select(d => d.Name));
-
-            if (!allDirs.Any()) { _logger.LogDebug("No browseable directories with allowed files found for {User}", username); return picks; }
-
-            var seedFileEntry = seedResp.Files.FirstOrDefault();
-            if (seedFileEntry == null) { _logger.LogWarning("Seed file entry missing in search response for {User}. Cannot establish context.", username); return picks; }
-
-            var seedPath = seedFileEntry.Filename;
-            int idx = seedPath.LastIndexOf(Sep);
-            var seedDir = (idx > 0) ? seedPath.Substring(0, idx) : "";
-            var seedFile = seedPath[(idx + 1)..];
-            var seedAlbum = Normalize(GetLastPathComponent(seedDir));
-            var seedArtist = Normalize(GetLastPathComponent(GetParentPath(seedDir)));
-            var seedTitle = Normalize(Path.GetFileNameWithoutExtension(seedFile));
-            _logger.LogDebug("Seed context: Artist='{A}', Album='{Al}', Title='{T}', Dir='{D}'", seedArtist, seedAlbum, seedTitle, seedDir);
-
-            var potentialFiles = allDirs
-                .SelectMany(kv => kv.Value.Files.Select(f => (DirPath: kv.Key, FileInfo: f)))
-                .Where(x => IsAllowedExtension(x.FileInfo.Filename) && x.FileInfo.Size > 0 && x.FileInfo.Size <= fileSizeCapBytes)
-                .Select(x => new {
-                    FullPath = x.DirPath + Sep + x.FileInfo.Filename,
-                    DirPath = x.DirPath,
-                    FileInfo = x.FileInfo,
-                    DirNameNorm = Normalize(GetLastPathComponent(x.DirPath)),
-                    ParentDirNameNorm = Normalize(GetLastPathComponent(GetParentPath(x.DirPath))),
-                    FileNameNorm = Normalize(Path.GetFileNameWithoutExtension(x.FileInfo.Filename))
-                })
-                .Where(x => Fuzz.Ratio(x.FileNameNorm, seedTitle) < SimilarityThreshold)
-                .ToList();
-
-            if (!potentialFiles.Any()) { _logger.LogDebug("No files found matching criteria (allowed extension, size, different title) for {User}", username); return picks; }
-
-            var priorityPicks = potentialFiles
-                .Where(x => Fuzz.Ratio(x.DirNameNorm, seedAlbum) < SimilarityThreshold &&
-                            Fuzz.Ratio(x.ParentDirNameNorm, seedArtist) < SimilarityThreshold)
-                .ToList();
-
-            Shuffle(priorityPicks);
-            foreach (var file in priorityPicks)
-            {
-                if (picks.Count >= maxPicks) break;
-                picks.Add(file.FullPath);
-                _logger.LogTrace("Picked (Priority): {Pick}", file.FullPath);
-            }
-
-            if (picks.Count < maxPicks)
-            {
-                var secondaryPicks = potentialFiles.Except(priorityPicks).ToList();
-                Shuffle(secondaryPicks);
-                foreach (var file in secondaryPicks)
-                {
-                    if (picks.Count >= maxPicks) break;
-                    picks.Add(file.FullPath);
-                    _logger.LogTrace("Picked (Secondary): {Pick}", file.FullPath);
-                }
-            }
-
+            browse = await _soulseekClient.BrowseAsync(username,
+               new BrowseOptions(responseTimeout: _options.PerPeerTimeoutSeconds * 1000),
+               cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+             _logger.LogWarning("Browse operation cancelled or timed out for {User}. IsCancellationRequested: {IsCancelled}", username, cancellationToken.IsCancellationRequested);
+             return picks;
+        }
+        catch (Exception ex) when (ex is UserOfflineException || ex is TimeoutException || ex is SoulseekClientException)
+        {
+            _logger.LogWarning("Failed to browse share for {User}: {Msg}", username, ex.Message);
             return picks;
         }
+        catch (Exception ex)
+        {
+             _logger.LogError(ex, "Unexpected error browsing share for {User}", username);
+             return picks;
+        }
+
+        long fileSizeCapBytes = (long)_options.FileSizeCapMB * 1024 * 1024;
+
+        var browseDirLookup = browse.Directories?
+            .Where(d => d != null && !string.IsNullOrEmpty(d.Name))
+            .ToDictionary(d => d.Name, d => d);
+
+        if (browseDirLookup == null || !browseDirLookup.Any())
+        {
+             _logger.LogDebug("No directories returned from browse operation for {User}.", username);
+             return picks;
+        }
+
+        var lockedDirs = new HashSet<string>(browse.LockedDirectories?.Select(d => d.Name) ?? Enumerable.Empty<string>());
+
+        // --- Seed Context ---
+        var seedPath = seedFileEntry.Filename;
+        var seedFileNameOnly = GetFileNameManual(seedPath);
+        var seedParentDir = GetParentPathManual(seedPath);
+        var seedFileNameWithoutExtension = GetFileNameWithoutExtensionManual(seedFileNameOnly);
+        var normalizedSeedFileNameForMatch = Normalize(seedFileNameWithoutExtension);
+
+        _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir);
+        _logger.LogDebug(" -> Seed Filename for Matching (Normalized): '{NormSeedFile}'", normalizedSeedFileNameForMatch);
+
+        if (string.IsNullOrEmpty(seedParentDir))
+        {
+            // --- Root Directory Fallback ---
+            _logger.LogWarning("Seed track '{SeedFile}' appears to be in the root directory (or path parsing failed). Cannot perform relative traversal for {User}.", seedFileNameOnly, username);
+             var fallbackPicks = browseDirLookup.Values
+                .Where(dir => dir.Files != null)
+                .SelectMany(dir => dir.Files)
+                .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
+                         && IsAllowedExtension(f.Filename)
+                         && f.Size > 0 && f.Size <= fileSizeCapBytes)
+                .Select(f => new { FullPath = f.Filename, NormalizedName = Normalize(GetFileNameWithoutExtensionManual(GetFileNameManual(f.Filename))) })
+                // *** Use TokenSetRatio for fallback comparison too ***
+                .Select(f => new { f.FullPath, Similarity = Fuzz.TokenSetRatio(f.NormalizedName, normalizedSeedFileNameForMatch) })
+                .Where(f => f.Similarity < SimilarityThreshold)
+                .OrderBy(f => f.Similarity) // Optional: maybe pick the least similar ones first? Or random?
+                .Take(maxPicks)
+                .Select(f => f.FullPath)
+                .ToList();
+
+             if (fallbackPicks.Any()) {
+                 _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}% using TokenSetRatio):",
+                    fallbackPicks.Count, maxPicks, SimilarityThreshold);
+                 foreach(var pick in fallbackPicks) {
+                     // We don't have the similarity score here easily without more refactoring, so just log the path
+                     _logger.LogDebug(" -> Fallback Pick: {FileName}", GetFileNameManual(pick));
+                     picks.Add(pick);
+                 }
+             } else {
+                 _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}% using TokenSetRatio).", SimilarityThreshold);
+             }
+             return picks;
+        }
+
+        // --- Traversal Logic ---
+        var traversalStack = new Stack<string>();
+        var visitedDirs = new HashSet<string>();
+        var pickedFromFileInDir = new HashSet<string>();
+
+        if (browseDirLookup.ContainsKey(seedParentDir) || lockedDirs.Contains(seedParentDir))
+        {
+             _logger.LogDebug("Starting traversal from seed parent directory: '{SeedParentDir}'", seedParentDir);
+             traversalStack.Push(seedParentDir);
+             visitedDirs.Add(seedParentDir);
+        }
+        else
+        {
+             _logger.LogWarning("Seed parent directory '{SeedParentDir}' not found in browse results or locked directories for {User}. Cannot start traversal.", seedParentDir, username);
+             return picks;
+        }
+
+        while (traversalStack.Count > 0 && picks.Count < maxPicks && !cancellationToken.IsCancellationRequested)
+        {
+            var currentDir = traversalStack.Pop();
+            _logger.LogDebug("Traversal: Popped '{CurrentDir}' from stack. Stack size: {StackSize}", currentDir, traversalStack.Count);
+
+            // --- 1. Process Files (if not already picked from this dir) ---
+            if (pickedFromFileInDir.Contains(currentDir))
+            {
+                _logger.LogTrace("Skipping file processing in directory '{CurrentDir}' as a file was already picked from it.", currentDir);
+            }
+            else if (lockedDirs.Contains(currentDir))
+            {
+                _logger.LogTrace("Skipping file processing in locked directory: {LockedDir}", currentDir);
+            }
+            else if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
+            {
+                _logger.LogDebug("Processing files in '{CurrentDir}'. Found {FileCount} files in browse data.", currentDir, currentDirEntry.Files.Count);
+                var filesInDir = currentDirEntry.Files
+                                    .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
+                                                && IsAllowedExtension(f.Filename)
+                                                && f.Size > 0 && f.Size <= fileSizeCapBytes)
+                                    .ToList();
+                _logger.LogDebug(" -> {Count} files meet extension/size criteria in '{CurrentDir}'.", filesInDir.Count, currentDir);
+
+                Shuffle(filesInDir);
+
+                bool pickedThisDir = false;
+                foreach (var file in filesInDir)
+                {
+                    var fullPath = file.Filename;
+                    var currentFileNameOnly = GetFileNameManual(fullPath);
+                    var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
+                    var normalizedCurrentFileName = Normalize(currentFileNameWithoutExtension);
+
+                    // *** USE TokenSetRatio FOR FILES ***
+                    int fileSimilarity = Fuzz.TokenSetRatio(normalizedCurrentFileName, normalizedSeedFileNameForMatch);
+
+                    // *** Log actual file similarity score ***
+                    _logger.LogTrace(" -> Checking file: '{FileName}' (Normalized: '{NormFile}') vs Seed (Normalized: '{NormSeed}'). TokenSetRatio: {Score}%",
+                        currentFileNameOnly, normalizedCurrentFileName, normalizedSeedFileNameForMatch, fileSimilarity);
+
+                    if (fileSimilarity < SimilarityThreshold)
+                    {
+                        picks.Add(fullPath);
+                        pickedFromFileInDir.Add(currentDir);
+                        pickedThisDir = true;
+                        _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedNorm}': {Score}%)",
+                            currentFileNameOnly, normalizedSeedFileNameForMatch, fileSimilarity);
+                        _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
+                        break; // Stop after one pick per directory
+                    }
+                    // No need for an else log here, the Trace log above covers skipped files implicitly
+                }
+                _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file? {PickedStatus}", currentDir, pickedThisDir);
+
+                if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
+                {
+                    _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
+                    break; // Exit while loop
+                }
+            }
+            else
+            {
+                _logger.LogTrace("Directory '{Dir}' not found in browse results or has null Files collection. Skipping file processing.", currentDir);
+            }
+            // --- End File Processing ---
+
+            // --- 2. Process Child Directories ---
+            _logger.LogDebug("Processing children of '{CurrentDir}'", currentDir);
+            var potentialChildren = browseDirLookup.Keys
+                .Where(path => IsDirectChildManual(currentDir, path))
+                .ToList();
+             potentialChildren.AddRange(lockedDirs
+                .Where(path => IsDirectChildManual(currentDir, path)));
+             potentialChildren = potentialChildren.Distinct().ToList();
+
+            _logger.LogDebug(" -> Found {Count} potential child directories for '{CurrentDir}'.", potentialChildren.Count, currentDir);
+
+            Shuffle(potentialChildren);
+
+            var dissimilarChildrenToPush = new List<string>(); // Collect dissimilar children here
+
+            foreach (var childDir in potentialChildren)
+            {
+                if (visitedDirs.Contains(childDir))
+                {
+                    _logger.LogTrace("Child '{ChildDir}' already visited. Skipping.", childDir);
+                    continue;
+                }
+
+                var childDirNameOnly = GetLastPathComponentManual(childDir);
+                var normalizedChildDirName = Normalize(childDirNameOnly);
+
+                // *** USE TokenSetRatio FOR DIRECTORIES ***
+                var similarity = Fuzz.TokenSetRatio(normalizedChildDirName, normalizedSeedFileNameForMatch);
+
+                // *** Log actual directory similarity score ***
+                _logger.LogTrace("Checking child dir '{ChildName}' (Normalized: '{NormChild}') against seed (Normalized: '{NormSeed}'). TokenSetRatio: {Similarity}%",
+                    childDirNameOnly, normalizedChildDirName, normalizedSeedFileNameForMatch, similarity);
+
+                if (similarity >= SimilarityThreshold)
+                {
+                    // Similar child found - log it, mark visited, and CONTINUE to the next child.
+                    _logger.LogDebug("Child directory '{ChildName}' is SIMILAR (TokenSetRatio: {Similarity} >= {Threshold}) to seed (Normalized: '{NormSeed}'). Marking visited, skipping descent.",
+                         childDirNameOnly, similarity, SimilarityThreshold, normalizedSeedFileNameForMatch);
+                    visitedDirs.Add(childDir);
+                    // Continue to the next child in the foreach loop
+                }
+                else
+                {
+                    // Dissimilar child found - add it to the list for potential pushing later.
+                     _logger.LogTrace("Child directory '{ChildName}' is DISSIMILAR (TokenSetRatio: {Similarity} < {Threshold}). Adding to potential exploration list.", childDirNameOnly, similarity, SimilarityThreshold);
+                    dissimilarChildrenToPush.Add(childDir);
+                }
+            } // --- End foreach childDir ---
+
+            // --- 3. Decide Traversal Action (Based on dissimilar children found) ---
+            var parentDir = GetParentPathManual(currentDir);
+            bool canGoUp = !string.IsNullOrEmpty(parentDir)
+                        && (browseDirLookup.ContainsKey(parentDir) || lockedDirs.Contains(parentDir));
+
+            if (dissimilarChildrenToPush.Any())
+            {
+                // Action: Explore Dissimilar Children found. Push them onto the stack.
+                _logger.LogDebug("Decision: Found {Count} dissimilar children for '{CurrentDir}'. Pushing them onto stack. Stack size before push: {StackSize}",
+                    dissimilarChildrenToPush.Count, currentDir, traversalStack.Count);
+                // Sort children alphabetically before pushing for deterministic behavior (optional)
+                foreach (var dissimilarChild in dissimilarChildrenToPush.OrderBy(d => d))
+                {
+                    if (!visitedDirs.Contains(dissimilarChild)) // Check visited again (safety)
+                    {
+                        traversalStack.Push(dissimilarChild);
+                        visitedDirs.Add(dissimilarChild); // Mark visited *when pushing*
+                         _logger.LogTrace(" -> Pushed dissimilar child: {ChildDir}", dissimilarChild);
+                    } else {
+                         _logger.LogTrace(" -> Skipping push of dissimilar child {ChildDir} as it became visited.", dissimilarChild);
+                    }
+                }
+                _logger.LogDebug(" -> Stack size after pushing dissimilar children: {StackSize}", traversalStack.Count);
+            }
+            else // No dissimilar children were found/added
+            {
+                // Action: Attempt to Go Up because no dissimilar children to explore from here.
+                _logger.LogDebug("Decision: No unvisited dissimilar children found for '{CurrentDir}'. Attempting to go up.", currentDir);
+                if (canGoUp)
+                {
+                    // Check visited before pushing parent to avoid loops/redundancy
+                    if (!visitedDirs.Contains(parentDir))
+                    {
+                        _logger.LogDebug(" -> Can go up. Pushing parent '{ParentDir}' onto stack. Stack size: {StackSize}", parentDir, traversalStack.Count + 1);
+                        traversalStack.Push(parentDir);
+                        visitedDirs.Add(parentDir); // Mark visited when pushing
+                    } else {
+                       _logger.LogTrace(" -> Parent '{ParentDir}' already visited, not pushing again to prevent potential loops.", parentDir);
+                    }
+                }
+                else
+                {
+                    _logger.LogDebug(" -> Cannot go up from '{CurrentDir}'. No parent, parent not in browse/locked results, or parent already visited. Ending branch exploration.", currentDir);
+                }
+            }
+        } // --- End while loop ---
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+             _logger.LogWarning("Crawl for {User} was cancelled during traversal.", username);
+        }
+
+        _logger.LogDebug("Traversal finished for {User}. Found {Count} picks (Quota: {Quota}).", username, picks.Count, maxPicks);
+        return picks;
+    }
 
         // --- Disconnect ---
         private async Task DisconnectGracefullyAsync()
@@ -563,40 +795,165 @@ namespace Spotify.Slsk.Integration.Services
                 }
             }
         }
+    /// <summary>
+    /// Normalizes a string for fuzzy matching (lowercase, simplified whitespace/punctuation).
+    /// </summary>
+    private static string Normalize(string s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        // Keep the existing normalization logic
+        var normalized = System.Text.RegularExpressions.Regex.Replace(s.ToLowerInvariant(), @"[\s\(\)\[\]\{\}\.\,\-_]+", " ").Trim();
+        return normalized;
+    }
 
+    /// <summary>
+    /// Checks if a filename has an allowed audio extension.
+    /// Uses Path.GetExtension which is generally safe for this purpose.
+    /// </summary>
+    private static bool IsAllowedExtension(string filename)
+    {
+        if (string.IsNullOrEmpty(filename)) return false;
+        // Path.GetExtension works reliably for finding the last dot and characters after it.
+        var ext = Path.GetExtension(filename)?.ToLowerInvariant();
+        return !string.IsNullOrEmpty(ext) && AllowedExtensions.Contains(ext);
+    }
+
+    /// <summary>
+    /// Shuffles a list in place.
+    /// </summary>
+    private void Shuffle<T>(IList<T> list)
+    {
+        int n = list.Count;
+        while (n > 1) { n--; int k = _random.Next(n + 1); (list[k], list[n]) = (list[n], list[k]); }
+    }
+
+    // --- Manual Path Parsing Helpers (using SoulseekSeparator) ---
+
+    /// <summary>
+    /// Manually extracts the filename part (after the last backslash) from a Soulseek path.
+    /// </summary>
+    /// <param name="path">The full Soulseek path.</param>
+    /// <returns>The filename, or the original path if no backslash is found.</returns>
+    private static string GetFileNameManual(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return "";
+        int lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator);
+        if (lastSeparatorIndex == -1)
+        {
+            return path; // No separator found, assume the whole string is the filename
+        }
+        // Ensure we don't return an empty string if path ends with a separator
+        if (lastSeparatorIndex == path.Length - 1)
+        {
+             // This case is unlikely for a file path but handle defensively
+             return "";
+        }
+        return path.Substring(lastSeparatorIndex + 1);
+    }
+
+    /// <summary>
+    /// Manually extracts the filename without the extension from a filename string.
+    /// Assumes 'filename' is just the file part, not the full path.
+    /// </summary>
+    /// <param name="filename">The filename (e.g., from GetFileNameManual).</param>
+    /// <returns>The filename without the last extension, or the original filename if no dot is found.</returns>
+    private static string GetFileNameWithoutExtensionManual(string? filename)
+    {
+        if (string.IsNullOrEmpty(filename)) return "";
+        int lastDotIndex = filename.LastIndexOf('.');
+        // Ensure the dot is not the first character (like hidden files ".bashrc")
+        // and that a dot actually exists.
+        if (lastDotIndex <= 0)
+        {
+            return filename; // No extension found or filename starts with a dot
+        }
+        return filename.Substring(0, lastDotIndex);
+    }
+
+    /// <summary>
+    /// Manually extracts the parent directory path (before the last backslash) from a Soulseek path.
+    /// </summary>
+    /// <param name="path">The full Soulseek path.</param>
+    /// <returns>The parent path, or null if no parent exists (root or single component).</returns>
+    private static string? GetParentPathManual(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        int lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator);
+        // If no separator or it's the only character (e.g., "\"), there's no parent part.
+        if (lastSeparatorIndex <= 0)
+        {
+            return null;
+        }
+        return path.Substring(0, lastSeparatorIndex);
+    }
+
+    /// <summary>
+    /// Manually extracts the last component of a Soulseek path (directory or filename).
+    /// Equivalent to GetFileNameManual, kept for semantic clarity where needed.
+    /// </summary>
+    /// <param name="path">The full Soulseek path.</param>
+    /// <returns>The last component of the path.</returns>
+    private static string GetLastPathComponentManual(string? path)
+    {
+        return GetFileNameManual(path); // Re-use the same logic
+    }
+
+    /// <summary>
+    /// Manually checks if 'childPath' is a direct child of 'parentPath' using SoulseekSeparator.
+    /// </summary>
+    private static bool IsDirectChildManual(string parentPath, string childPath)
+    {
+        if (string.IsNullOrEmpty(parentPath) || string.IsNullOrEmpty(childPath)) return false;
+        // Ensure child path is longer and starts with parent path + separator
+        if (childPath.Length > parentPath.Length + 1 && childPath.StartsWith(parentPath + SoulseekSeparator))
+        {
+            // Ensure there are no more separators after the parent part
+            int nextSeparatorIndex = childPath.IndexOf(SoulseekSeparator, parentPath.Length + 1);
+            return nextSeparatorIndex == -1;
+        }
+        return false;
+    }
+	
+	/*
         // --- Helper Methods --- (Keep existing ones)
-        private static string Normalize(string s)
-        {
-            if (string.IsNullOrWhiteSpace(s)) return "";
-            var normalized = System.Text.RegularExpressions.Regex.Replace(s.ToLowerInvariant(), @"[\s\(\)\[\]\{\}\.\,\-_]+", " ").Trim();
-            return normalized;
-        }
+		private static string Normalize(string s)
+		{
+			if (string.IsNullOrWhiteSpace(s)) return "";
+			// Keep the existing normalization logic
+			var normalized = System.Text.RegularExpressions.Regex.Replace(s.ToLowerInvariant(), @"[\s\(\)\[\]\{\}\.\,\-_]+", " ").Trim();
+			return normalized;
+		}
 
-        private static bool IsAllowedExtension(string filename)
-        {
-            var ext = Path.GetExtension(filename)?.ToLowerInvariant();
-            return !string.IsNullOrEmpty(ext) && AllowedExtensions.Contains(ext);
-        }
+		private static bool IsAllowedExtension(string filename)
+		{
+			if (string.IsNullOrEmpty(filename)) return false;
+			var ext = Path.GetExtension(filename)?.ToLowerInvariant();
+			return !string.IsNullOrEmpty(ext) && AllowedExtensions.Contains(ext);
+		}
 
-        private void Shuffle<T>(IList<T> list)
-        {
-            int n = list.Count;
-            while (n > 1) { n--; int k = _random.Next(n + 1); (list[k], list[n]) = (list[n], list[k]); }
-        }
+		private void Shuffle<T>(IList<T> list)
+		{
+			int n = list.Count;
+			while (n > 1) { n--; int k = _random.Next(n + 1); (list[k], list[n]) = (list[n], list[k]); }
+		}
 
-        private static string? GetParentPath(string? path)
-        {
-            if (string.IsNullOrEmpty(path)) return null;
-            int idx = path.LastIndexOf("\\");
-            if (idx <= 0) return null;
-            return path.Substring(0, idx);
-        }
+		// Assuming Soulseek paths use '\'. If they use '/', this needs adjustment.
+		private static string? GetParentPath(string? path)
+		{
+			if (string.IsNullOrEmpty(path)) return null;
+			int idx = path.LastIndexOf('\\'); // Use the separator defined earlier
+			// Handle edge case: path like "C:\" or just "\"
+			if (idx <= 0) return null; // Root or single component
+			return path.Substring(0, idx);
+		}
 
-        private static string GetLastPathComponent(string? path)
-        {
-            if (string.IsNullOrEmpty(path)) return "";
-            int idx = path.LastIndexOf("\\");
-            return path.Substring(idx + 1);
-        }
+		// Assuming Soulseek paths use '\'.
+		private static string GetLastPathComponent(string? path)
+		{
+			if (string.IsNullOrEmpty(path)) return "";
+			int idx = path.LastIndexOf('\\'); // Use the separator defined earlier
+			return path.Substring(idx + 1);
+		}*/
+
     } // End SoulseekRadarService Class
 } // End Namespace
