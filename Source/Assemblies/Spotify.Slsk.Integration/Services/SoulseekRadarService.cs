@@ -206,8 +206,10 @@ namespace Spotify.Slsk.Integration.Services
 					}
 					if (picks.Any())
 					{
-						allPotentialDownloads.AddRange(picks.Select(p => (user, p)));
-						_logger.LogInformation(" -> Found {Count} potential picks for {User}: {Picks}", picks.Count, user, string.Join("; ", picks.Select(p => Path.GetFileName(p))));
+                        // Ensure paths are not null/empty before adding
+                        var validPicks = picks.Where(p => !string.IsNullOrEmpty(p)).ToList();
+						allPotentialDownloads.AddRange(validPicks.Select(p => (user, p)));
+						_logger.LogInformation(" -> Found {Count} potential picks for {User}: {Picks}", validPicks.Count, user, string.Join("; ", validPicks.Select(p => Path.GetFileName(p))));
 					}
 					else
 					{
@@ -237,6 +239,12 @@ namespace Spotify.Slsk.Integration.Services
                 foreach (var target in allPotentialDownloads)
                 {
                     if (overallCts.IsCancellationRequested) break;
+                    // *** FIX: Add check for empty/null remote path before starting task ***
+                    if (string.IsNullOrEmpty(target.RemoteFilePath))
+                    {
+                        _logger.LogWarning("Skipping potential download for user {User} due to null or empty remote path.", target.Username);
+                        continue;
+                    }
 
                     var task = Task.Run(async () =>
                     {
@@ -263,29 +271,41 @@ namespace Spotify.Slsk.Integration.Services
 
                             // 2. Prepare for Download
                             tempFilePath = Path.GetTempFileName(); // Gets a path like /tmp/tmpXXXX.tmp
-                            _logger.LogDebug("Preparing download: {User} -> '{RemotePath}' to '{LocalTempPath}'", target.Username, target.RemoteFilePath, tempFilePath);
+                            // *** FIX: Log the FULL remote path here for debugging ***
+                            _logger.LogDebug("Preparing download: {User} -> FULL REMOTE PATH: '{RemotePath}' to '{LocalTempPath}'", target.Username, target.RemoteFilePath, tempFilePath);
 
                             using var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
                             downloadCts.CancelAfter(TimeSpan.FromSeconds(_options.PerPeerTimeoutSeconds));
 
                             var transferOptions = new TransferOptions(
                                 stateChanged: args => { /* Logging as before */
+                                    // Check if Transfer object is null before accessing properties
+                                    if (args.Transfer == null) {
+                                        _logger.LogWarning("Download State Changed: Transfer object is NULL. Previous State: {PrevState}", args.PreviousState);
+                                        return;
+                                    }
                                     if (!args.Transfer.State.HasFlag(TransferStates.Completed)) { _logger.LogTrace("Download State: {User} - {File} -> {State}", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.State); }
                                     else { _logger.LogDebug("Download Final State: {User} - {File} -> {State} (Prev: {PrevState})", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.State, args.PreviousState); }
                                 },
                                 progressUpdated: args => { /* Logging as before */
+                                    // Check if Transfer object is null before accessing properties
+                                    if (args.Transfer == null) {
+                                        _logger.LogWarning("Download Progress Updated: Transfer object is NULL.");
+                                        return;
+                                    }
                                     _logger.LogDebug("Download Progress: {User} - {File} | {Percent:F1}% ({Bytes}/{TotalBytes}) @ {Speed:F1} kB/s", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.PercentComplete, args.Transfer.BytesTransferred, args.Transfer.Size, args.Transfer.AverageSpeed / 1024.0);
                                 }
                             );
 
                             // 3. Execute Download
+                            // Use Path.GetFileName for the INFO log, but the DEBUG log above shows the full path used
                             _logger.LogInformation("Starting download: {User} - '{File}'", target.Username, Path.GetFileName(target.RemoteFilePath));
                             downloadStopwatch.Start();
                             try
                             {
                                 transferResult = await _soulseekClient.DownloadAsync(
                                     username: target.Username,
-                                    remoteFilename: target.RemoteFilePath,
+                                    remoteFilename: target.RemoteFilePath, // Use the full path
                                     localFilename: tempFilePath, // Download to the .tmp path
                                     options: transferOptions,
                                     cancellationToken: downloadCts.Token);
@@ -295,7 +315,7 @@ namespace Spotify.Slsk.Integration.Services
                                 if (ex is OperationCanceledException && !overallCts.IsCancellationRequested) { _logger.LogWarning("Download timed out ({Timeout}s) during call: {User} - '{File}'", _options.PerPeerTimeoutSeconds, target.Username, Path.GetFileName(target.RemoteFilePath)); }
                                 else if (ex is OperationCanceledException && overallCts.IsCancellationRequested) { _logger.LogWarning("Download cancelled (overall) during call: {User} - '{File}'", target.Username, Path.GetFileName(target.RemoteFilePath)); }
                                 else if (ex is UserOfflineException uoEx) { _logger.LogWarning("Download failed (User Offline) during call: {User} - '{File}'. {Msg}", target.Username, Path.GetFileName(target.RemoteFilePath), uoEx.Message); }
-                                else if (ex is TransferRejectedException trEx) { _logger.LogWarning("Download failed (Rejected by Peer) during call: {User} - '{File}'. {Msg}", target.Username, Path.GetFileName(target.RemoteFilePath), trEx.Message); }
+                                else if (ex is TransferRejectedException trEx) { _logger.LogWarning("Download failed (Rejected by Peer) during call: {User} - '{File}'. Reason: '{Msg}'. Full Remote Path Attempted: '{FullPath}'", target.Username, Path.GetFileName(target.RemoteFilePath), trEx.Message, target.RemoteFilePath); } // Log full path on rejection
                                 else if (ex is SoulseekClientException scEx) { _logger.LogWarning(scEx, "Download failed (Soulseek Error) during call: {User} - '{File}'", target.Username, Path.GetFileName(target.RemoteFilePath)); }
                                 else if (ex is IOException ioEx) { _logger.LogError(ioEx, "Download failed (IO Error) during call: {User} - '{File}'", target.Username, Path.GetFileName(target.RemoteFilePath)); }
                                 else { _logger.LogError(ex, "Download failed (Unexpected Error) during call: {User} - '{File}'", target.Username, Path.GetFileName(target.RemoteFilePath)); }
@@ -396,9 +416,12 @@ namespace Spotify.Slsk.Integration.Services
                             else // Download Failed/Rejected/TimedOut/Errored/etc.
                             {
                                 string reason = transferResult?.State.ToString() ?? "Unknown (Transfer object null)";
-                                string? exceptionMessage = transferResult?.Exception?.GetBaseException().Message;
-                                _logger.LogWarning("Download Task Completed: FAILED - {User} - '{File}'. Final State: {Reason}. Duration: {Duration:N1}s. Exception: {Exception}",
-                                    target.Username, Path.GetFileName(target.RemoteFilePath), reason, downloadStopwatch.Elapsed.TotalSeconds, exceptionMessage ?? "N/A");
+                                // Safely access exception message
+                                string? exceptionMessage = null;
+                                try { exceptionMessage = transferResult?.Exception?.GetBaseException()?.Message; } catch { /* Ignore potential null refs */ }
+
+                                _logger.LogWarning("Download Task Completed: FAILED - {User} - '{File}'. Final State: {Reason}. Duration: {Duration:N1}s. Exception: {Exception}. Full Remote Path Attempted: '{FullPath}'",
+                                    target.Username, Path.GetFileName(target.RemoteFilePath), reason, downloadStopwatch.Elapsed.TotalSeconds, exceptionMessage ?? "N/A", target.RemoteFilePath); // Log full path on failure
                             }
                         }
                         catch (OperationCanceledException) { /* Handling as before */
@@ -547,7 +570,7 @@ namespace Spotify.Slsk.Integration.Services
 
         var browseDirLookup = browse.Directories?
             .Where(d => d != null && !string.IsNullOrEmpty(d.Name))
-            .ToDictionary(d => d.Name, d => d);
+            .ToDictionary(d => d.Name, d => d, StringComparer.Ordinal); // Use Ordinal comparer
 
         if (browseDirLookup == null || !browseDirLookup.Any())
         {
@@ -555,9 +578,14 @@ namespace Spotify.Slsk.Integration.Services
              return picks;
         }
 
-        var lockedDirs = new HashSet<string>(browse.LockedDirectories?.Select(d => d.Name) ?? Enumerable.Empty<string>());
+        var lockedDirs = new HashSet<string>(browse.LockedDirectories?.Select(d => d.Name) ?? Enumerable.Empty<string>(), StringComparer.Ordinal); // Use Ordinal comparer
 
         // --- Seed Context ---
+        // Ensure seedFileEntry and its Filename are not null
+        if (seedFileEntry == null || string.IsNullOrEmpty(seedFileEntry.Filename)) {
+            _logger.LogError("Seed file entry or its filename is null/empty for user {User}. Cannot proceed with crawl.", username);
+            return picks;
+        }
         var seedPath = seedFileEntry.Filename;
         var seedFileNameOnly = GetFileNameManual(seedPath);
         var seedParentDir = GetParentPathManual(seedPath); // Nullable string
@@ -613,8 +641,8 @@ namespace Spotify.Slsk.Integration.Services
 
         // --- Traversal Logic ---
         var traversalStack = new Stack<string>();
-        var visitedDirs = new HashSet<string>();
-        var pickedFromFileInDir = new HashSet<string>();
+        var visitedDirs = new HashSet<string>(StringComparer.Ordinal); // Use Ordinal comparer
+        var pickedFromFileInDir = new HashSet<string>(StringComparer.Ordinal); // Use Ordinal comparer
 
         // Check if seed parent exists in browse results or locked dirs before pushing
         if (browseDirLookup.ContainsKey(seedParentDir) || lockedDirs.Contains(seedParentDir))
@@ -635,7 +663,7 @@ namespace Spotify.Slsk.Integration.Services
             _logger.LogDebug("Traversal: Popped '{CurrentDir}' from stack. Stack size: {StackSize}", currentDir, traversalStack.Count);
 
             // *** BUG FIX START: Check if the current directory is the seed's parent directory ***
-            bool isSeedParentDirectory = currentDir.Equals(seedParentDir, StringComparison.Ordinal);
+            bool isSeedParentDirectory = currentDir.Equals(seedParentDir, StringComparison.Ordinal); // Use Ordinal comparison
             if (isSeedParentDirectory)
             {
                 _logger.LogDebug("Skipping file processing in '{CurrentDir}' because it is the seed track's parent directory.", currentDir);
@@ -669,6 +697,11 @@ namespace Spotify.Slsk.Integration.Services
                     bool pickedThisDir = false;
                     foreach (var file in filesInDir)
                     {
+                        // Ensure file.Filename is not null before proceeding
+                        if (string.IsNullOrEmpty(file.Filename)) {
+                            _logger.LogWarning("Skipping file entry with null/empty filename in directory '{CurrentDir}'", currentDir);
+                            continue;
+                        }
                         var fullPath = file.Filename;
                         var currentFileNameOnly = GetFileNameManual(fullPath);
                         var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
@@ -731,12 +764,12 @@ namespace Spotify.Slsk.Integration.Services
 
             // --- 2. Process Child Directories (Always do this, even for seed parent) ---
             _logger.LogDebug("Processing children of '{CurrentDir}'", currentDir);
+            // Combine potential children from browse results and locked directories
             var potentialChildren = browseDirLookup.Keys
+                .Concat(lockedDirs)
                 .Where(path => IsDirectChildManual(currentDir, path))
+                .Distinct(StringComparer.Ordinal) // Use Ordinal comparer
                 .ToList();
-             potentialChildren.AddRange(lockedDirs
-                .Where(path => IsDirectChildManual(currentDir, path)));
-             potentialChildren = potentialChildren.Distinct().ToList();
 
             _logger.LogDebug(" -> Found {Count} potential child directories for '{CurrentDir}'.", potentialChildren.Count, currentDir);
 
@@ -801,7 +834,7 @@ namespace Spotify.Slsk.Integration.Services
                 _logger.LogDebug("Decision: Found {Count} dissimilar children for '{CurrentDir}'. Pushing them onto stack. Stack size before push: {StackSize}",
                     dissimilarChildrenToPush.Count, currentDir, traversalStack.Count);
                 // Sort children alphabetically before pushing for deterministic behavior (optional)
-                foreach (var dissimilarChild in dissimilarChildrenToPush.OrderBy(d => d))
+                foreach (var dissimilarChild in dissimilarChildrenToPush.OrderBy(d => d, StringComparer.Ordinal)) // Use Ordinal comparer
                 {
                     if (!visitedDirs.Contains(dissimilarChild)) // Check visited again (safety)
                     {
@@ -954,7 +987,7 @@ namespace Spotify.Slsk.Integration.Services
     /// Manually extracts the filename part (after the last backslash) from a Soulseek path.
     /// </summary>
     /// <param name="path">The full Soulseek path.</param>
-    /// <returns>The filename, or the original path if no backslash is found.</returns>
+    /// <returns>The filename, or the original path if no backslash is found, or empty string if path is null/empty.</returns>
     private static string GetFileNameManual(string? path)
     {
         if (string.IsNullOrEmpty(path)) return "";
@@ -964,7 +997,7 @@ namespace Spotify.Slsk.Integration.Services
             return path; // No separator found, assume the whole string is the filename
         }
         // Ensure we don't return an empty string if path ends with a separator
-        if (lastSeparatorIndex == path.Length - 1)
+        if (lastSeparatorIndex >= path.Length - 1) // Use >= to handle trailing slash robustly
         {
              // This case is unlikely for a file path but handle defensively
              return "";
@@ -977,7 +1010,7 @@ namespace Spotify.Slsk.Integration.Services
     /// Assumes 'filename' is just the file part, not the full path.
     /// </summary>
     /// <param name="filename">The filename (e.g., from GetFileNameManual).</param>
-    /// <returns>The filename without the last extension, or the original filename if no dot is found.</returns>
+    /// <returns>The filename without the last extension, or the original filename if no dot is found, or empty string if filename is null/empty.</returns>
     private static string GetFileNameWithoutExtensionManual(string? filename)
     {
         if (string.IsNullOrEmpty(filename)) return "";
@@ -1001,40 +1034,69 @@ namespace Spotify.Slsk.Integration.Services
         if (string.IsNullOrEmpty(path)) return null;
         int lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator);
         // If no separator or it's the only character (e.g., "\"), there's no parent part.
+        // Check index > 0 to handle paths like "file.txt" correctly (no parent).
         if (lastSeparatorIndex <= 0)
         {
             return null;
         }
+        // Handle paths ending in a separator correctly, find the *previous* separator
+        if (lastSeparatorIndex == path.Length - 1) {
+            lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator, lastSeparatorIndex - 1);
+            if (lastSeparatorIndex < 0) return null; // e.g. path was "\" or "folder\"
+        }
+
         return path.Substring(0, lastSeparatorIndex);
     }
 
     /// <summary>
     /// Manually extracts the last component of a Soulseek path (directory or filename).
-    /// Equivalent to GetFileNameManual, kept for semantic clarity where needed.
+    /// Equivalent to GetFileNameManual, kept for semantic clarity where needed. Handles trailing slashes.
     /// </summary>
     /// <param name="path">The full Soulseek path.</param>
-    /// <returns>The last component of the path.</returns>
+    /// <returns>The last component of the path, or empty string if path is null/empty or just separators.</returns>
     private static string GetLastPathComponentManual(string? path)
     {
-        return GetFileNameManual(path); // Re-use the same logic
+        if (string.IsNullOrEmpty(path)) return "";
+
+        // Trim trailing separators first
+        string trimmedPath = path.TrimEnd(SoulseekSeparator);
+
+        if (string.IsNullOrEmpty(trimmedPath)) return ""; // Path was only separators
+
+        int lastSeparatorIndex = trimmedPath.LastIndexOf(SoulseekSeparator);
+        if (lastSeparatorIndex == -1)
+        {
+            return trimmedPath; // No separator found after trimming
+        }
+        // No need to check for lastSeparatorIndex == trimmedPath.Length - 1 after TrimEnd
+        return trimmedPath.Substring(lastSeparatorIndex + 1);
     }
+
 
     /// <summary>
     /// Manually checks if 'childPath' is a direct child of 'parentPath' using SoulseekSeparator.
-    /// Uses OrdinalIgnoreCase for comparison.
+    /// Uses Ordinal comparison (case-sensitive, as Soulseek paths often are).
+    /// Handles paths that might end with separators.
     /// </summary>
     private static bool IsDirectChildManual(string parentPath, string childPath)
     {
         if (string.IsNullOrEmpty(parentPath) || string.IsNullOrEmpty(childPath)) return false;
-        // Ensure child path is longer and starts with parent path + separator (case-insensitive)
-        if (childPath.Length > parentPath.Length + 1 && childPath.StartsWith(parentPath + SoulseekSeparator, StringComparison.Ordinal))
-        {
-            // Ensure there are no more separators after the parent part
-            // Start searching *after* the expected separator following the parent path
-            int nextSeparatorIndex = childPath.IndexOf(SoulseekSeparator, parentPath.Length + 1);
-            return nextSeparatorIndex == -1;
-        }
-        return false;
+
+        // Normalize by removing trailing separators for comparison robustness
+        string normParent = parentPath.TrimEnd(SoulseekSeparator);
+        string normChild = childPath.TrimEnd(SoulseekSeparator);
+
+        // Basic checks: child must be longer than parent
+        if (normChild.Length <= normParent.Length) return false;
+
+        // Child must start with parent + separator
+        if (!normChild.StartsWith(normParent + SoulseekSeparator, StringComparison.Ordinal)) return false;
+
+        // Ensure there are no more separators *after* the parent part in the child path
+        // Start searching *after* the expected separator following the parent path
+        // Use normParent.Length + 1 as the starting index for the search in normChild
+        int nextSeparatorIndex = normChild.IndexOf(SoulseekSeparator, normParent.Length + 1);
+        return nextSeparatorIndex == -1; // True if no further separators are found
     }
 
     /*
