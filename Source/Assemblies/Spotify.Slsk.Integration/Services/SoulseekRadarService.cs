@@ -987,18 +987,18 @@ Now, analyze this path and provide only the required output:
             {
                 _logger.LogDebug("Decision: Found {Count} dissimilar children for '{CurrentDir}'. Pushing them onto stack. Stack size before push: {StackSize}",
                     dissimilarChildrenToPush.Count, currentDir, traversalStack.Count);
-                // Push in reverse order of preference if needed, but current shuffle + push is fine
-                foreach (var dissimilarChild in dissimilarChildrenToPush.OrderBy(d => d, StringComparer.Ordinal)) // Consistent order helps debugging
-                {
-                    if (!visitedDirs.Contains(dissimilarChild))
-                    {
-                        traversalStack.Push(dissimilarChild);
-                        visitedDirs.Add(dissimilarChild);
-                         _logger.LogTrace(" -> Pushed dissimilar child: {ChildDir}", dissimilarChild);
-                    } else {
-                         _logger.LogTrace(" -> Skipping push of dissimilar child {ChildDir} as it became visited.", dissimilarChild);
-                    }
-                }
+				// Push the dissimilar children in the order they were found (which is based on the shuffled potentialChildren list)
+				foreach (var dissimilarChild in dissimilarChildrenToPush) // REMOVED OrderBy
+				{
+					if (!visitedDirs.Contains(dissimilarChild))
+					{
+						traversalStack.Push(dissimilarChild);
+						visitedDirs.Add(dissimilarChild);
+						 _logger.LogTrace(" -> Pushed dissimilar child: {ChildDir}", dissimilarChild);
+					} else {
+						 _logger.LogTrace(" -> Skipping push of dissimilar child {ChildDir} as it became visited.", dissimilarChild);
+					}
+				}
                 _logger.LogDebug(" -> Stack size after pushing dissimilar children: {StackSize}", traversalStack.Count);
             }
             else // No dissimilar children to explore downwards
