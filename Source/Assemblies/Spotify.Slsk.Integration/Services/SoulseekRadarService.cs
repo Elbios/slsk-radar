@@ -833,29 +833,45 @@ Now, analyze this path and provide only the required output:
                                         _logger.LogInformation("Gemini Action: Validated artist folder '{ArtistFolder}' found at path '{ArtistPath}'. Redirecting traversal.",
                                             validatedArtistFolderName, artistFolderPath);
 
-                                        // Clear stack and redirect
+                                        // *** MODIFIED: Clear stack AND reset visitedDirs appropriately ***
                                         traversalStack.Clear();
-                                        visitedDirs.Add(artistFolderPath); // Mark the artist folder itself as visited to avoid re-entering
-                                        _logger.LogDebug(" -> Cleared traversal stack. Added '{ArtistPath}' to visited.", artistFolderPath);
+                                        _logger.LogDebug(" -> Cleared traversal stack.");
 
+                                        // Reset visitedDirs, keeping only essential ones
+                                        var newVisitedDirs = new HashSet<string>(StringComparer.Ordinal);
+                                        if (!string.IsNullOrEmpty(seedParentDir))
+                                        {
+                                            newVisitedDirs.Add(seedParentDir); // Keep seed parent visited
+                                            _logger.LogTrace(" -> Preserving seed parent '{Dir}' in new visited set.", seedParentDir);
+                                        }
+                                        newVisitedDirs.Add(currentDir); // Keep the directory where the pick happened visited
+                                        _logger.LogTrace(" -> Preserving picked directory '{Dir}' in new visited set.", currentDir);
+                                        newVisitedDirs.Add(artistFolderPath); // Keep the identified artist folder visited
+                                        _logger.LogTrace(" -> Preserving artist directory '{Dir}' in new visited set.", artistFolderPath);
+
+                                        visitedDirs = newVisitedDirs; // Replace old set with the new one
+                                        _logger.LogDebug(" -> Reset visitedDirs set, preserving essential paths. New size: {Count}", visitedDirs.Count);
+
+
+                                        // Push the parent onto the cleared stack if valid
                                         if (!string.IsNullOrEmpty(artistParentPath) && (browseDirLookup.ContainsKey(artistParentPath) || lockedDirs.Contains(artistParentPath)))
                                         {
-                                            if (!visitedDirs.Contains(artistParentPath))
+                                            if (!visitedDirs.Contains(artistParentPath)) // Check the *new* visited set
                                             {
                                                 traversalStack.Push(artistParentPath);
-                                                visitedDirs.Add(artistParentPath);
-                                                _logger.LogInformation(" -> Pushing parent '{ParentPath}' onto stack to continue search above artist level.", artistParentPath);
+                                                visitedDirs.Add(artistParentPath); // Add parent to visited *now*
+                                                _logger.LogInformation(" -> Pushing parent '{ParentPath}' onto stack to continue search above artist level. Added to visited.", artistParentPath);
                                             }
                                             else
                                             {
-                                                 _logger.LogDebug(" -> Parent '{ParentPath}' already visited. Not pushing.", artistParentPath);
+                                                 _logger.LogDebug(" -> Parent '{ParentPath}' was already in the essential preserved set (e.g., was seed parent). Not pushing again.", artistParentPath);
                                             }
                                         }
                                         else
                                         {
-                                            _logger.LogInformation(" -> Artist folder '{ArtistFolder}' has no valid parent or is at root. Traversal will continue if stack had prior entries (unlikely here) or stop.", validatedArtistFolderName);
+                                            _logger.LogInformation(" -> Artist folder '{ArtistFolder}' has no valid parent or is at root. Traversal will stop unless stack had prior entries (unlikely after clear).", validatedArtistFolderName);
                                         }
-                                        // Break file loop and let the main while loop re-evaluate with the modified stack
+                                        // Break file loop and let the main while loop re-evaluate with the modified stack/visited
                                         goto EndFileProcessing;
                                     }
                                     else
@@ -905,7 +921,7 @@ Now, analyze this path and provide only the required output:
 
             // If Gemini modified the stack, we want the while loop to immediately process the new top item (the parent)
             if (pickedThisIteration && !skipGeminiHeuristic && traversalStack.Count > 0) {
-                 _logger.LogDebug("Gemini heuristic potentially modified stack. Continuing to next iteration of while loop.");
+                 _logger.LogDebug("Gemini heuristic potentially modified stack and pushed parent. Continuing to next iteration of while loop.");
                  continue; // Skip child processing for currentDir, process the parent pushed by Gemini
             }
 
