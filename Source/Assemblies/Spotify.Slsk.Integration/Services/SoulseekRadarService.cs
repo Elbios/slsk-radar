@@ -16,6 +16,9 @@ using System.Collections.Concurrent;
 using TagLib; // Added for ID3 tags
 using System.Diagnostics; // For Stopwatch if needed, though Transfer object has timing
 using System.Text.RegularExpressions; // Added for Regex preprocessing
+using Mscc.GenerativeAI; // *** ADDED: For Gemini API ***
+using System.Net.Http; // *** ADDED: For HttpRequestException ***
+using System.Net; // *** ADDED: For HttpStatusCode ***
 
 namespace Spotify.Slsk.Integration.Services
 {
@@ -25,18 +28,21 @@ namespace Spotify.Slsk.Integration.Services
         private readonly SoulseekClient _soulseekClient;
         private readonly SoulseekRadarOptions _options;
         private readonly Random _random = new Random();
-		// Define the Soulseek path separator explicitly
-		private const char SoulseekSeparator = '\\';
+        private readonly GenerativeModel? _geminiModel; // *** ADDED: Gemini Model Client ***
+        private readonly string _geminiPromptTemplate; // *** ADDED: Store prompt template ***
+
+        private const char SoulseekSeparator = '\\';
         private const int MinShareSizeFiles = 50;
-        // *** CHANGE 2: Define Max Share Size ***
         private const int MaxShareSizeFiles = 700000;
-        // Similarity threshold for fuzzy matching (lower means MORE dissimilar items are picked)
         private const int SimilarityThreshold = 53;
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string> { ".mp3", ".flac", ".m4a", ".ogg" };
-
-        // Regex for removing content within parentheses or brackets
         private static readonly Regex ParenthesesContentRegex = new Regex(@"\[.*?\]|\(.*?\)", RegexOptions.Compiled);
-        // Removed DigitWordRegex as specific first-word logic is now used in PreprocessForFuzzyMatch
+
+        // *** ADDED: Constants for Gemini interaction ***
+        private const string GeminiModelName = "gemini-2.0-flash"; // Use the appropriate model identifier
+        private const int MaxGeminiRetries = 5; // For exponential backoff
+        private const int MaxGeminiTotalRetryDelaySeconds = 60;
+
 
         public SoulseekRadarService(
             ILogger<SoulseekRadarService> logger,
@@ -48,9 +54,60 @@ namespace Spotify.Slsk.Integration.Services
             _options = new SoulseekRadarOptions();
             configuration.GetSection("SoulseekRadar").Bind(_options);
             _logger.LogInformation("SoulseekRadarService initialized with options: {@Options}", _options);
+
+            // *** ADDED: Initialize Gemini Client ***
+            var apiKey = Environment.GetEnvironmentVariable("GOOGLE_API_KEY");
+            if (string.IsNullOrEmpty(apiKey))
+            {
+                _logger.LogWarning("GOOGLE_API_KEY environment variable not found. Artist identification heuristic will be disabled.");
+                _geminiModel = null;
+            }
+            else
+            {
+                try
+                {
+                    var googleAI = new GoogleAI(apiKey);
+                    // Use the specific model name for Gemini 1.5 Flash
+                    _geminiModel = googleAI.GenerativeModel(model: GeminiModelName);
+                    _logger.LogInformation("Gemini client initialized successfully for model: {ModelName}", GeminiModelName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to initialize Gemini client. Artist identification heuristic will be disabled.");
+                    _geminiModel = null;
+                }
+            }
+
+            // *** ADDED: Define the prompt template ***
+            _geminiPromptTemplate = @"
+Analyze the following directory path, which comes from a user's P2P music share (using '\' as the separator). Your goal is to find the *first* folder name in the path that represents *exactly* the artist's name and nothing else.
+
+Look through the folder names from left to right. Skip common folders like 'Music', 'Downloads', genre names (e.g., 'Rock', 'Alternative'), and compilation indicators ('VA', 'Various Artists', 'Soundtracks').
+
+The folder you select must **only** be the artist's name. Do **not** choose folders that also include album titles, years, formats, or other details (e.g., ignore a folder named 'Artist Name - Album Title [FLAC]').
+
+Output the exact folder name if you find one that is purely the artist's name. If no such folder exists in the path, or if you are unsure, you MUST output the literal word `None`.
+
+Example 1:
+Input: `music\Alternative\Billy Bragg\Billy Bragg - Life's A Riot With Spy vs Spy (2013) flac`
+Output: `Billy Bragg`
+*(Reason: 'Billy Bragg' is the first folder that is exactly the artist name, before the folder containing album info.)*
+
+Example 2:
+Input: `My Music\Pink Floyd - The Wall [FLAC]\01 - Song.mp3`
+Output: `None`
+*(Reason: The folder 'Pink Floyd - The Wall [FLAC]' contains more than just the artist name. There's no folder named just 'Pink Floyd'.)*
+
+Example 3:
+Input: `Rock\VA - Rock Anthems\Some Song.mp3`
+Output: `None`
+*(Reason: 'Rock' is a genre, 'VA' indicates a compilation.)*
+
+Now, analyze this path and provide only the required output:
+""{0}""
+"; // {0} will be replaced with the actual path
         }
 
-       // Only showing DiscoverTracksAsync and methods it calls that changed
         public async Task DiscoverTracksAsync(
             string seedTrackQuery,
             string ssUsername,
@@ -109,7 +166,7 @@ namespace Spotify.Slsk.Integration.Services
 
 
                 // --- Step 2: Fetch stats & select users ---
-                 _logger.LogInformation("STEP 2: Fetching stats for up to {MaxCheck} users (timeout {T}s per user)...", _options.MaxUsers * 2, _options.PerPeerTimeoutSeconds);
+                _logger.LogInformation("STEP 2: Fetching stats for up to {MaxCheck} users (timeout {T}s per user)...", _options.MaxUsers * 2, _options.PerPeerTimeoutSeconds);
                 var shareData = new List<(string Username, int FileCount)>();
                 var usersToCheck = uniqueUsers.OrderByDescending(u => u.UploadSpeed).Take(Math.Min(uniqueUsers.Count, _options.MaxUsers * 2)).ToList();
 
@@ -149,58 +206,70 @@ namespace Spotify.Slsk.Integration.Services
 
                 var selectedUsers = shareData.OrderBy(x => x.FileCount).Take(_options.MaxUsers).Select(x => x.Username).ToList();
                 _logger.LogInformation("Selected {Count} users for crawling: {Users}", selectedUsers.Count, string.Join(", ", selectedUsers));
-                int perUserQuota = (selectedUsers.Count <= _options.MaxUsers / 2 && _options.MaxUsers > 0) ? _options.MaxPerUserQuotaSmallU : _options.PerUserQuotaLargeU;
-                _logger.LogInformation("Calculated per-user quota: {Quota} (based on {SelectedCount} selected users)", perUserQuota, selectedUsers.Count);
+                int perUserPickQuota = (selectedUsers.Count <= _options.MaxUsers / 2 && _options.MaxUsers > 0) ? _options.MaxPerUserQuotaSmallU : _options.PerUserQuotaLargeU;
+                _logger.LogInformation("Calculated per-user PICK quota: {Quota} (based on {SelectedCount} selected users)", perUserPickQuota, selectedUsers.Count);
+
+                // *** ADDED: Calculate Gemini call quota ***
+                int maxGeminiCallsPerUser = (_geminiModel == null) ? 0 : (selectedUsers.Count >= 7 ? 1 : 2);
+                if (_geminiModel != null)
+                {
+                    _logger.LogInformation("Calculated per-user GEMINI call quota: {Quota} (based on {SelectedCount} selected users)", maxGeminiCallsPerUser, selectedUsers.Count);
+                }
+                else
+                {
+                     _logger.LogInformation("Gemini heuristic disabled (no API key or client init failed).");
+                }
 
 
                 // --- Step 3: Crawl & pick recommendations ---
-				_logger.LogInformation("STEP 3: Crawling shares and picking up to {N} potential tracks per user", perUserQuota);
-				var allPotentialDownloads = new List<(string Username, string RemoteFilePath)>();
-				foreach (var user in selectedUsers)
-				{
-					if (overallCts.IsCancellationRequested) break;
-					_logger.LogInformation("===> Processing user {User}...", user);
-					var seedResp = uniqueUsers.FirstOrDefault(r => r.Username == user);
-					if (seedResp == null || !seedResp.Files.Any())
-					{
-						_logger.LogWarning("Could not find original search response or files for user {User}. Skipping crawl.", user);
-						continue;
-					}
-					var seedFileEntry = seedResp.Files.First();
+                _logger.LogInformation("STEP 3: Crawling shares and picking up to {N} potential tracks per user", perUserPickQuota);
+                var allPotentialDownloads = new List<(string Username, string RemoteFilePath)>();
+                foreach (var user in selectedUsers)
+                {
+                    if (overallCts.IsCancellationRequested) break;
+                    _logger.LogInformation("===> Processing user {User}...", user);
+                    var seedResp = uniqueUsers.FirstOrDefault(r => r.Username == user);
+                    if (seedResp == null || !seedResp.Files.Any())
+                    {
+                        _logger.LogWarning("Could not find original search response or files for user {User}. Skipping crawl.", user);
+                        continue;
+                    }
+                    var seedFileEntry = seedResp.Files.First();
 
-					List<string> picks;
-					using var crawlCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
-					try
-					{
-						crawlCts.CancelAfter(TimeSpan.FromSeconds(_options.CrawlTimeoutSeconds));
-						picks = await CrawlAndPickAsync(user, seedFileEntry, perUserQuota, crawlCts.Token);
-					}
-					catch (OperationCanceledException) when (!overallCts.IsCancellationRequested && crawlCts.IsCancellationRequested)
-					{
-						_logger.LogWarning("Timeout ({Timeout}s) during crawl for {User}", _options.CrawlTimeoutSeconds, user);
-						continue;
-					}
-					catch (OperationCanceledException) when (overallCts.IsCancellationRequested)
-					{
-						_logger.LogWarning("Crawl cancelled (overall operation) for {User}", user);
-						break;
-					}
-					catch (Exception ex)
-					{
-						_logger.LogWarning(ex, "Error during crawl for {User}", user);
-						continue;
-					}
-					if (picks.Any())
-					{
+                    List<string> picks;
+                    using var crawlCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
+                    try
+                    {
+                        crawlCts.CancelAfter(TimeSpan.FromSeconds(_options.CrawlTimeoutSeconds));
+                        // *** MODIFIED: Pass maxGeminiCallsPerUser to CrawlAndPickAsync ***
+                        picks = await CrawlAndPickAsync(user, seedFileEntry, perUserPickQuota, maxGeminiCallsPerUser, crawlCts.Token);
+                    }
+                    catch (OperationCanceledException) when (!overallCts.IsCancellationRequested && crawlCts.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("Timeout ({Timeout}s) during crawl for {User}", _options.CrawlTimeoutSeconds, user);
+                        continue;
+                    }
+                    catch (OperationCanceledException) when (overallCts.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("Crawl cancelled (overall operation) for {User}", user);
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Error during crawl for {User}", user);
+                        continue;
+                    }
+                    if (picks.Any())
+                    {
                         var validPicks = picks.Where(p => !string.IsNullOrEmpty(p)).ToList();
-						allPotentialDownloads.AddRange(validPicks.Select(p => (user, p))); // 'p' should now be the full path
-						_logger.LogInformation(" -> Found {Count} potential picks for {User}: {Picks}", validPicks.Count, user, string.Join("; ", validPicks.Select(p => Path.GetFileName(p)))); // Log only filename for brevity
-					}
-					else
-					{
-						_logger.LogInformation(" -> Found no suitable picks for {User}", user);
-					}
-				}
+                        allPotentialDownloads.AddRange(validPicks.Select(p => (user, p))); // 'p' should now be the full path
+                        _logger.LogInformation(" -> Found {Count} potential picks for {User}: {Picks}", validPicks.Count, user, string.Join("; ", validPicks.Select(p => Path.GetFileName(p)))); // Log only filename for brevity
+                    }
+                    else
+                    {
+                        _logger.LogInformation(" -> Found no suitable picks for {User}", user);
+                    }
+                }
                 if (overallCts.IsCancellationRequested) { _logger.LogWarning("Operation cancelled during user share crawling."); await DisconnectGracefullyAsync(); return; }
                 _logger.LogInformation("Step 3 complete. Total potential downloads identified: {Total}", allPotentialDownloads.Count);
                 if (!allPotentialDownloads.Any()) { _logger.LogWarning("No potential tracks identified across all selected users. Exiting."); await DisconnectGracefullyAsync(); return; }
@@ -209,7 +278,7 @@ namespace Spotify.Slsk.Integration.Services
                 // --- Step 4: Parallel Harvesting & Metadata Extraction ---
                 _logger.LogInformation("STEP 4: Starting parallel download and metadata extraction...");
                 _logger.LogInformation(" -> Global Concurrency Limit: {Limit}", _options.GlobalDownloadConcurrency);
-                _logger.LogInformation(" -> Per-User Success Quota (incl. ID3): {Quota}", perUserQuota);
+                _logger.LogInformation(" -> Per-User Success Quota (incl. ID3): {Quota}", perUserPickQuota); // Note: This is pick quota, not download quota
                 _logger.LogInformation(" -> Individual Download Timeout: {Timeout}s", _options.PerPeerTimeoutSeconds);
                 _logger.LogInformation(" -> Overall Track Limit: {Limit}", _options.OverallTrackLimit);
 
@@ -229,6 +298,13 @@ namespace Spotify.Slsk.Integration.Services
                         continue;
                     }
 
+                    // Check overall harvest limit early to avoid unnecessary semaphore waits/downloads
+                    if (successfulHarvests.Count >= _options.OverallTrackLimit)
+                    {
+                        _logger.LogInformation("Overall track limit ({Limit}) reached. Skipping further download attempts.", _options.OverallTrackLimit);
+                        break;
+                    }
+
                     var task = Task.Run(async () =>
                     {
                         string tempFilePath = string.Empty;
@@ -240,22 +316,28 @@ namespace Spotify.Slsk.Integration.Services
 
                         try
                         {
-                            // 1. Acquire Concurrency Slot & Check Quota
+                            // 0. Check overall limit again inside task
+                            if (successfulHarvests.Count >= _options.OverallTrackLimit) return;
+
+                            // 1. Acquire Concurrency Slot & Check User Quota (for SUCCESSFUL harvests)
                             _logger.LogTrace("Waiting for semaphore slot for {User} - {File}", target.Username, Path.GetFileName(currentFullRemotePath));
                             await downloadSemaphore.WaitAsync(overallCts.Token);
                             semaphoreAcquired = true;
                             _logger.LogTrace("Semaphore slot acquired for {User} - {File}", target.Username, Path.GetFileName(currentFullRemotePath));
                             overallCts.Token.ThrowIfCancellationRequested();
 
-                            if (userSuccessCounters.TryGetValue(target.Username, out var currentCount) && currentCount >= perUserQuota)
+                            // Check user QUOTA based on SUCCESSFUL harvests, not just attempts
+                            if (userSuccessCounters.TryGetValue(target.Username, out var currentSuccessCount) && currentSuccessCount >= perUserPickQuota)
                             {
-                                _logger.LogDebug("Skipping download for {User} - {File}: User quota ({Quota}) already met.", target.Username, Path.GetFileName(currentFullRemotePath), perUserQuota);
+                                _logger.LogDebug("Skipping download for {User} - {File}: User SUCCESS quota ({Quota}) already met.", target.Username, Path.GetFileName(currentFullRemotePath), perUserPickQuota);
                                 return;
                             }
+                            // Check overall limit one more time after acquiring semaphore
+                            if (successfulHarvests.Count >= _options.OverallTrackLimit) return;
+
 
                             // 2. Prepare for Download
                             tempFilePath = Path.GetTempFileName();
-                            // Log the FULL path being used
                             _logger.LogDebug("Preparing download: {User} -> FULL REMOTE PATH: '{RemotePath}' to '{LocalTempPath}'", target.Username, currentFullRemotePath, tempFilePath);
 
                             using var downloadCts = CancellationTokenSource.CreateLinkedTokenSource(overallCts.Token);
@@ -275,7 +357,8 @@ namespace Spotify.Slsk.Integration.Services
                                          _logger.LogWarning("Download Progress Updated: Transfer object is NULL. Target: {User} - {File}", target.Username, Path.GetFileName(currentFullRemotePath));
                                         return;
                                     }
-                                    _logger.LogTrace("Download Progress: {User} - {File} | {Percent:F1}% ({Bytes}/{TotalBytes}) @ {Speed:F1} kB/s", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.PercentComplete, args.Transfer.BytesTransferred, args.Transfer.Size, args.Transfer.AverageSpeed / 1024.0);
+                                    // Reduce verbosity of progress logging
+                                    // _logger.LogTrace("Download Progress: {User} - {File} | {Percent:F1}% ({Bytes}/{TotalBytes}) @ {Speed:F1} kB/s", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.PercentComplete, args.Transfer.BytesTransferred, args.Transfer.Size, args.Transfer.AverageSpeed / 1024.0);
                                 }
                             );
 
@@ -347,7 +430,7 @@ namespace Spotify.Slsk.Integration.Services
                                         try
                                         {
                                             _logger.LogDebug("Renaming '{Source}' to '{Dest}' for TagLib.", tempFilePath, renamedTempFilePath);
-                                            System.IO.File.Move(tempFilePath, renamedTempFilePath, true);
+                                            System.IO.File.Move(tempFilePath, renamedTempFilePath, true); // Overwrite if exists (unlikely but possible)
                                             renameSuccess = true;
                                         }
                                         catch (Exception ex)
@@ -363,24 +446,37 @@ namespace Spotify.Slsk.Integration.Services
                                                 using var tagFile = TagLib.File.Create(renamedTempFilePath);
 
                                                 string artist = tagFile.Tag.FirstPerformer ?? tagFile.Tag.FirstAlbumArtist ?? string.Empty;
-                                                string title = tagFile.Tag.Title ?? Path.GetFileNameWithoutExtension(currentFullRemotePath);
+                                                string title = tagFile.Tag.Title ?? GetFileNameWithoutExtensionManual(GetFileNameManual(currentFullRemotePath)); // Fallback to filename
                                                 string album = tagFile.Tag.Album ?? string.Empty;
 
                                                 if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title)) {
                                                     _logger.LogWarning("ID3 Extraction Warning: Could not extract Artist or Title from {RenamedPath}. Skipping harvest.", renamedTempFilePath);
                                                 } else {
-                                                    var harvestedInfo = new HarvestedFileInfo {
-                                                        Username = target.Username, RemoteFilePath = currentFullRemotePath,
-                                                        LocalTempPath = renamedTempFilePath,
-                                                        Artist = artist.Trim(), Title = title.Trim(), Album = album.Trim(),
-                                                        FileSize = transferResult.Size
-                                                    };
-                                                    _logger.LogInformation("ID3 Extracted Successfully: {Info}", harvestedInfo);
-                                                    successfulHarvests.Add(harvestedInfo);
+                                                    // Check overall limit BEFORE adding to bag and incrementing counter
+                                                    if (successfulHarvests.Count < _options.OverallTrackLimit)
+                                                    {
+                                                        var harvestedInfo = new HarvestedFileInfo {
+                                                            Username = target.Username, RemoteFilePath = currentFullRemotePath,
+                                                            LocalTempPath = renamedTempFilePath, // Store path for potential later use? No, it gets deleted. Store null?
+                                                            Artist = artist.Trim(), Title = title.Trim(), Album = album.Trim(),
+                                                            FileSize = transferResult.Size
+                                                        };
+                                                        _logger.LogInformation("ID3 Extracted Successfully: {Info}", harvestedInfo);
+                                                        successfulHarvests.Add(harvestedInfo);
 
-                                                    // 6. Increment User Success Count
-                                                    var newCount = userSuccessCounters.AddOrUpdate(target.Username, 1, (key, count) => count + 1);
-                                                    _logger.LogDebug("Incremented success count (incl. ID3) for {User} to {Count}/{Quota}", target.Username, newCount, perUserQuota);
+                                                        // 6. Increment User Success Count only if added
+                                                        var newCount = userSuccessCounters.AddOrUpdate(target.Username, 1, (key, count) => count + 1);
+                                                        _logger.LogDebug("Incremented success count (incl. ID3) for {User} to {Count}/{Quota}", target.Username, newCount, perUserPickQuota);
+
+                                                        // Check if overall limit reached AFTER adding
+                                                        if (successfulHarvests.Count >= _options.OverallTrackLimit)
+                                                        {
+                                                            _logger.LogInformation("Overall track limit ({Limit}) reached during harvest. Signalling cancellation.", _options.OverallTrackLimit);
+                                                            overallCts.Cancel(); // Signal cancellation to stop other tasks
+                                                        }
+                                                    } else {
+                                                         _logger.LogDebug("Overall track limit reached before adding harvest for {User} - {File}", target.Username, Path.GetFileName(currentFullRemotePath));
+                                                    }
                                                 }
                                             }
                                             catch (CorruptFileException ex) { _logger.LogWarning(ex, "ID3 Extraction Failed (Corrupt File): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath); }
@@ -412,11 +508,13 @@ namespace Spotify.Slsk.Integration.Services
                         finally
                         {
                             // 7. Cleanup Temporary File(s)
-                            if (!string.IsNullOrEmpty(renamedTempFilePath) && System.IO.File.Exists(renamedTempFilePath))
+                            // Only delete renamed if it exists AND is different from original temp path
+                            if (!string.IsNullOrEmpty(renamedTempFilePath) && !renamedTempFilePath.Equals(tempFilePath, StringComparison.OrdinalIgnoreCase) && System.IO.File.Exists(renamedTempFilePath))
                             {
                                 try { System.IO.File.Delete(renamedTempFilePath); _logger.LogTrace("Deleted renamed temporary file: {RenamedPath}", renamedTempFilePath); }
                                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete renamed temporary file: {RenamedPath}", renamedTempFilePath); }
                             }
+                            // Always try to delete the original temp path if it exists
                             if (!string.IsNullOrEmpty(tempFilePath) && System.IO.File.Exists(tempFilePath))
                             {
                                 try { System.IO.File.Delete(tempFilePath); _logger.LogTrace("Deleted original temporary file: {TempPath}", tempFilePath); }
@@ -434,16 +532,21 @@ namespace Spotify.Slsk.Integration.Services
                 _logger.LogInformation("Waiting for {Count} download tasks to complete...", downloadTasks.Count);
                 try
                 {
+                    // Wait for tasks, but respect overall cancellation
                     await Task.WhenAll(downloadTasks);
+                }
+                catch (OperationCanceledException) {
+                    _logger.LogWarning("Task.WhenAll cancelled, likely due to overall limit reached.");
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Unexpected error during Task.WhenAll for downloads.");
                 }
 
-                _logger.LogInformation("All download tasks finished.");
+                _logger.LogInformation("All download tasks finished or cancelled.");
 
                 // --- Post-Processing ---
+                // Apply overall limit again just in case concurrent additions exceeded it slightly
                 var finalHarvestedTracks = successfulHarvests
                     .OrderBy(h => h.Username)
                     .ThenBy(h => h.RemoteFilePath)
@@ -462,17 +565,15 @@ namespace Spotify.Slsk.Integration.Services
                     _logger.LogInformation("Final Harvested Tracks (with valid ID3):");
                     foreach(var track in finalHarvestedTracks)
                     {
-                        _logger.LogInformation("  -> {TrackInfo}", track);
+                        // Log harvested info (maybe less verbose?)
+                         _logger.LogInformation("  -> U: {User}, A: {Artist}, T: {Title}, Al: {Album} (From: {RemotePath})",
+                                              track.Username, track.Artist, track.Title, track.Album, track.RemoteFilePath);
                     }
                 }
 
-                // --- NEW Step 5: Spotify Matching & Playlist Preparation (Placeholder) ---
+                // --- Placeholder Steps ---
                 _logger.LogInformation("STEP 5: Spotify Matching (Not Implemented Yet)");
-                // TODO: Implement Spotify matching logic using finalHarvestedTracks
-
-                // --- NEW Step 6: Spotify Playlist Creation/Update (Placeholder) ---
                 _logger.LogInformation("STEP 6: Spotify Playlist Creation (Not Implemented Yet)");
-                // TODO: Implement Spotify playlist logic using matched Spotify URIs
 
             }
             catch (OperationCanceledException)
@@ -487,38 +588,29 @@ namespace Spotify.Slsk.Integration.Services
             {
                 if (!overallCts.IsCancellationRequested)
                 {
-                    overallCts.Cancel();
+                    overallCts.Cancel(); // Ensure cancellation propagates if exiting early
                 }
                 await DisconnectGracefullyAsync();
                 overallCts.Dispose();
             }
-        } // End DiscoverTracksAsync
+        }
 
     /// <summary>
-    /// Crawls a user's share starting from a seed track's location, picking related but different tracks.
-    /// Picks at most ONE track per directory.
-    /// Uses fuzzy matching (TokenSetRatio) between directory/file names and the seed track's filename
-    /// (without extension or path) to guide exploration and avoid duplicates.
-    /// Relies on manual path parsing using backslash as separator.
-    /// It explores dissimilar child directories first. If a directory only contains similar children (or already visited ones),
-    /// or has no children, it attempts to move up the hierarchy.
+    /// Crawls a user's share, picking related but different tracks, potentially using Gemini for artist diversity.
     /// </summary>
-    /// <param name="username">The user whose share to crawl.</param>
-    /// <param name="seedFileEntry">The specific file entry from the initial search result representing the seed track.</param>
-    /// <param name="maxPicks">The maximum number of track paths to pick (overall).</param>
-    /// <param name="cancellationToken">Cancellation token for the crawl operation.</param>
-    /// <returns>A list of full remote file paths for potential download.</returns>
     private async Task<List<string>> CrawlAndPickAsync(
         string username,
-        Soulseek.File seedFileEntry, // Specific File entry
-        int maxPicks,       // Overall quota
+        Soulseek.File seedFileEntry,
+        int maxPicks,
+        int maxGeminiCallsPerUser, // *** ADDED: Gemini call quota ***
         CancellationToken cancellationToken)
     {
         var picks = new List<string>();
-        const char Sep = SoulseekSeparator;
+        int geminiCallsMade = 0; // *** ADDED: Counter for Gemini calls ***
+        bool skipGeminiHeuristic = _geminiModel == null || maxGeminiCallsPerUser <= 0; // *** ADDED: Flag to disable Gemini for this user ***
 
-        _logger.LogDebug("Browsing share for {User} (seeking {MaxPicks} picks total, 1 per dir, timeout {T}s for browse, threshold {Threshold}%)",
-            username, maxPicks, _options.PerPeerTimeoutSeconds, SimilarityThreshold);
+        _logger.LogDebug("Browsing share for {User} (seeking {MaxPicks} picks total, 1 per dir, timeout {T}s for browse, threshold {Threshold}%, Gemini Quota: {GeminiQuota})",
+            username, maxPicks, _options.PerPeerTimeoutSeconds, SimilarityThreshold, maxGeminiCallsPerUser);
         BrowseResponse browse;
         try
         {
@@ -573,23 +665,21 @@ namespace Spotify.Slsk.Integration.Services
         // Handle case where seed is in root or path parsing failed
         if (string.IsNullOrEmpty(seedParentDir))
         {
-            // --- Root Directory Fallback ---
-            _logger.LogWarning("Seed track '{SeedFile}' appears to be in the root directory (or path parsing failed). Cannot perform relative traversal for {User}.", seedFileNameOnly, username);
+             _logger.LogWarning("Seed track '{SeedFile}' appears to be in the root directory (or path parsing failed). Cannot perform relative traversal for {User}. Performing fallback pick.", seedFileNameOnly, username);
              var fallbackPicks = browseDirLookup.Values
                 .Where(dir => dir.Files != null)
-                .SelectMany(dir => dir.Files.Select(f => new { DirectoryName = dir.Name, FileEntry = f })) // Keep directory context
+                .SelectMany(dir => dir.Files.Select(f => new { DirectoryName = dir.Name, FileEntry = f }))
                 .Where(df => df.FileEntry != null && !string.IsNullOrEmpty(df.FileEntry.Filename)
                          && IsAllowedExtension(df.FileEntry.Filename)
                          && df.FileEntry.Size > 0 && df.FileEntry.Size <= fileSizeCapBytes)
                 .Select(df => {
-                     // Reconstruct path here as well for fallback
                      string potentialRelativeFileName = df.FileEntry.Filename;
                      string reconstructedFullPath = potentialRelativeFileName.Contains(SoulseekSeparator)
                         ? potentialRelativeFileName
                         : df.DirectoryName + SoulseekSeparator + potentialRelativeFileName;
                      return new {
-                        FullPath = reconstructedFullPath, // Use reconstructed path
-                        PreprocessedName = PreprocessForFuzzyMatch(GetFileNameWithoutExtensionManual(GetFileNameManual(reconstructedFullPath))) // Preprocess based on reconstructed path
+                        FullPath = reconstructedFullPath,
+                        PreprocessedName = PreprocessForFuzzyMatch(GetFileNameWithoutExtensionManual(GetFileNameManual(reconstructedFullPath)))
                      };
                  })
                 .Select(f => new {
@@ -601,18 +691,18 @@ namespace Spotify.Slsk.Integration.Services
                 .Where(f => f.Similarity < SimilarityThreshold)
                 .OrderBy(f => f.Similarity)
                 .Take(maxPicks)
-                .Select(f => f.FullPath) // Select the full path
+                .Select(f => f.FullPath)
                 .ToList();
 
              if (fallbackPicks.Any()) {
-                 _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}% using TokenSetRatio with preprocessing):",
+                 _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}%):",
                     fallbackPicks.Count, maxPicks, SimilarityThreshold);
                  foreach(var pick in fallbackPicks) {
-                     _logger.LogDebug(" -> Fallback Pick: {FullPickPath}", pick); // Log the full path
+                     _logger.LogDebug(" -> Fallback Pick: {FullPickPath}", pick);
                      picks.Add(pick);
                  }
              } else {
-                 _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}% using TokenSetRatio with preprocessing).", SimilarityThreshold);
+                 _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}%).", SimilarityThreshold);
              }
              return picks;
         }
@@ -646,17 +736,10 @@ namespace Spotify.Slsk.Integration.Services
             }
 
             // --- 1. Process Files (Only if NOT the seed parent dir and not already picked from) ---
-            if (!isSeedParentDirectory)
+            bool pickedThisIteration = false; // Track if a pick happened in *this* iteration
+            if (!isSeedParentDirectory && !pickedFromFileInDir.Contains(currentDir) && !lockedDirs.Contains(currentDir))
             {
-                if (pickedFromFileInDir.Contains(currentDir))
-                {
-                    _logger.LogTrace("Skipping file processing in directory '{CurrentDir}' as a file was already picked from it.", currentDir);
-                }
-                else if (lockedDirs.Contains(currentDir))
-                {
-                    _logger.LogTrace("Skipping file processing in locked directory: {LockedDir}", currentDir);
-                }
-                else if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
+                 if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
                 {
                     _logger.LogDebug("Processing files in '{CurrentDir}'. Found {FileCount} files in browse data.", currentDir, currentDirEntry.Files.Count);
                     var filesInDir = currentDirEntry.Files
@@ -668,7 +751,6 @@ namespace Spotify.Slsk.Integration.Services
 
                     Shuffle(filesInDir);
 
-                    bool pickedThisDir = false;
                     foreach (var file in filesInDir)
                     {
                         if (string.IsNullOrEmpty(file.Filename)) {
@@ -676,18 +758,15 @@ namespace Spotify.Slsk.Integration.Services
                             continue;
                         }
 
-                        // *** FIX: Construct the full path ***
                         string potentialRelativeFileName = file.Filename;
                         string reconstructedFullPath;
                         if (potentialRelativeFileName.Contains(SoulseekSeparator))
                         {
-                            // If filename contains separator, assume it's already absolute (or malformed relative)
                             reconstructedFullPath = potentialRelativeFileName;
                             _logger.LogTrace(" -> File entry '{FileName}' in dir '{CurrentDir}' seems to contain a separator; using as-is.", potentialRelativeFileName, currentDir);
                         }
                         else
                         {
-                            // Assume relative, combine with current directory path
                             reconstructedFullPath = currentDir + SoulseekSeparator + potentialRelativeFileName;
                             _logger.LogTrace(" -> Reconstructing full path: '{CurrentDir}' + '{FileName}' = '{FullPath}'", currentDir, potentialRelativeFileName, reconstructedFullPath);
                         }
@@ -712,13 +791,94 @@ namespace Spotify.Slsk.Integration.Services
 
                         if (fileSimilarity < SimilarityThreshold)
                         {
-                            // *** FIX: Add the RECONSTRUCTED full path ***
                             picks.Add(reconstructedFullPath);
                             pickedFromFileInDir.Add(currentDir);
-                            pickedThisDir = true;
+                            pickedThisIteration = true; // Mark that a pick happened
                             _logger.LogDebug("Picked file: {FileName} (Full Path: '{FullPath}', TokenSetRatio to seed '{SeedPreprocessed}': {Score}% < {Threshold}%)",
                                 currentFileNameOnly, reconstructedFullPath, preprocessedSeedFileName, fileSimilarity, SimilarityThreshold);
                             _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
+
+                            // *** ADDED: Gemini Artist Heuristic Trigger ***
+                            if (!skipGeminiHeuristic && geminiCallsMade < maxGeminiCallsPerUser)
+                            {
+                                geminiCallsMade++;
+                                _logger.LogInformation("Gemini Trigger: First pick from user {User}. Calling Gemini to identify artist in path: '{Path}' (Call {CallNum}/{MaxCalls})",
+                                    username, currentDir, geminiCallsMade, maxGeminiCallsPerUser);
+
+                                string? artistFolderName = await GetArtistFolderFromPathAsync(currentDir, cancellationToken);
+
+                                if (artistFolderName != null)
+                                {
+                                    _logger.LogInformation("Gemini Response for '{Path}': Identified '{ArtistFolder}' as potential artist folder.", currentDir, artistFolderName);
+
+                                    // Validate and find the actual path component
+                                    string[] pathComponents = currentDir.Split(SoulseekSeparator);
+                                    int artistIndex = -1;
+                                    for(int i = 0; i < pathComponents.Length; i++)
+                                    {
+                                        // Use OrdinalIgnoreCase for robustness against casing variations, though prompt asks for exact.
+                                        if (pathComponents[i].Equals(artistFolderName, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            artistIndex = i;
+                                            break;
+                                        }
+                                    }
+
+                                    if (artistIndex != -1)
+                                    {
+                                        string validatedArtistFolderName = pathComponents[artistIndex]; // Use the actual casing from the path
+                                        string artistFolderPath = string.Join(SoulseekSeparator.ToString(), pathComponents.Take(artistIndex + 1));
+                                        string? artistParentPath = (artistIndex == 0) ? null : string.Join(SoulseekSeparator.ToString(), pathComponents.Take(artistIndex));
+
+                                        _logger.LogInformation("Gemini Action: Validated artist folder '{ArtistFolder}' found at path '{ArtistPath}'. Redirecting traversal.",
+                                            validatedArtistFolderName, artistFolderPath);
+
+                                        // Clear stack and redirect
+                                        traversalStack.Clear();
+                                        visitedDirs.Add(artistFolderPath); // Mark the artist folder itself as visited to avoid re-entering
+                                        _logger.LogDebug(" -> Cleared traversal stack. Added '{ArtistPath}' to visited.", artistFolderPath);
+
+                                        if (!string.IsNullOrEmpty(artistParentPath) && (browseDirLookup.ContainsKey(artistParentPath) || lockedDirs.Contains(artistParentPath)))
+                                        {
+                                            if (!visitedDirs.Contains(artistParentPath))
+                                            {
+                                                traversalStack.Push(artistParentPath);
+                                                visitedDirs.Add(artistParentPath);
+                                                _logger.LogInformation(" -> Pushing parent '{ParentPath}' onto stack to continue search above artist level.", artistParentPath);
+                                            }
+                                            else
+                                            {
+                                                 _logger.LogDebug(" -> Parent '{ParentPath}' already visited. Not pushing.", artistParentPath);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            _logger.LogInformation(" -> Artist folder '{ArtistFolder}' has no valid parent or is at root. Traversal will continue if stack had prior entries (unlikely here) or stop.", validatedArtistFolderName);
+                                        }
+                                        // Break file loop and let the main while loop re-evaluate with the modified stack
+                                        goto EndFileProcessing;
+                                    }
+                                    else
+                                    {
+                                        _logger.LogWarning("Gemini Validation Failed: Folder '{ArtistFolder}' returned by Gemini not found as a component in path '{Path}'. Disabling heuristic for this user.",
+                                            artistFolderName, currentDir);
+                                        skipGeminiHeuristic = true;
+                                    }
+                                }
+                                else
+                                {
+                                    // Gemini returned "None" or an error occurred (handled in GetArtistFolderFromPathAsync)
+                                    _logger.LogInformation("Gemini Response for '{Path}': No specific artist folder identified or error occurred. Continuing standard traversal.", currentDir);
+                                    // If an error occurred, GetArtistFolderFromPathAsync might have already set skipGeminiHeuristic
+                                    if (artistFolderName == null && !cancellationToken.IsCancellationRequested) // Check if it was an error vs "None"
+                                    {
+                                         // Assume error if null was returned without cancellation
+                                         // skipGeminiHeuristic = true; // Let GetArtistFolderFromPathAsync handle this based on retry outcome
+                                    }
+                                }
+                            }
+                            // *** END Gemini Section ***
+
                             break; // Stop after one pick per directory
                         }
                         else
@@ -726,26 +886,29 @@ namespace Spotify.Slsk.Integration.Services
                             _logger.LogDebug(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)",
                                 currentFileNameOnly, fileSimilarity, SimilarityThreshold);
                         }
-                    }
-                    _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file? {PickedStatus}", currentDir, pickedThisDir);
-
-                    if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
-                    {
-                        _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
-                        break;
-                    }
+                    } // End foreach file
+                    EndFileProcessing:; // Label for goto
+                    _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file this iteration? {PickedStatus}", currentDir, pickedThisIteration);
                 }
                 else
                 {
                     _logger.LogTrace("Directory '{Dir}' not found in browse results or has null Files collection. Skipping file processing.", currentDir);
                 }
-            } // --- End File Processing ---
+            } // --- End File Processing Check ---
 
+            // Check limits / cancellation *after* potential Gemini stack modification
             if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
             {
-                 _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested after file processing check. Stopping traversal.", maxPicks);
+                 _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
                  break;
             }
+
+            // If Gemini modified the stack, we want the while loop to immediately process the new top item (the parent)
+            if (pickedThisIteration && !skipGeminiHeuristic && traversalStack.Count > 0) {
+                 _logger.LogDebug("Gemini heuristic potentially modified stack. Continuing to next iteration of while loop.");
+                 continue; // Skip child processing for currentDir, process the parent pushed by Gemini
+            }
+
 
             // --- 2. Process Child Directories ---
             _logger.LogDebug("Processing children of '{CurrentDir}'", currentDir);
@@ -808,7 +971,8 @@ namespace Spotify.Slsk.Integration.Services
             {
                 _logger.LogDebug("Decision: Found {Count} dissimilar children for '{CurrentDir}'. Pushing them onto stack. Stack size before push: {StackSize}",
                     dissimilarChildrenToPush.Count, currentDir, traversalStack.Count);
-                foreach (var dissimilarChild in dissimilarChildrenToPush.OrderBy(d => d, StringComparer.Ordinal))
+                // Push in reverse order of preference if needed, but current shuffle + push is fine
+                foreach (var dissimilarChild in dissimilarChildrenToPush.OrderBy(d => d, StringComparer.Ordinal)) // Consistent order helps debugging
                 {
                     if (!visitedDirs.Contains(dissimilarChild))
                     {
@@ -821,7 +985,7 @@ namespace Spotify.Slsk.Integration.Services
                 }
                 _logger.LogDebug(" -> Stack size after pushing dissimilar children: {StackSize}", traversalStack.Count);
             }
-            else
+            else // No dissimilar children to explore downwards
             {
                 _logger.LogDebug("Decision: No unvisited dissimilar children found for '{CurrentDir}'. Attempting to go up.", currentDir);
                 if (canGoUp && parentDir != null)
@@ -832,7 +996,7 @@ namespace Spotify.Slsk.Integration.Services
                         traversalStack.Push(parentDir);
                         visitedDirs.Add(parentDir);
                     } else {
-                       _logger.LogTrace(" -> Parent '{ParentDir}' already visited, not pushing again to prevent potential loops.", parentDir);
+                       _logger.LogTrace(" -> Parent '{ParentDir}' already visited, not pushing again.", parentDir);
                     }
                 }
                 else
@@ -847,9 +1011,126 @@ namespace Spotify.Slsk.Integration.Services
              _logger.LogWarning("Crawl for {User} was cancelled during traversal.", username);
         }
 
-        _logger.LogDebug("Traversal finished for {User}. Found {Count} picks (Quota: {Quota}).", username, picks.Count, maxPicks);
+        _logger.LogDebug("Traversal finished for {User}. Found {Count} picks (Quota: {Quota}). Gemini calls made: {GeminiCalls}", username, picks.Count, maxPicks, geminiCallsMade);
         return picks;
     }
+
+    // *** ADDED: Method to call Gemini API with retry logic ***
+    /// <summary>
+    /// Calls the Gemini API to identify the artist folder in a given path.
+    /// Includes retry logic for rate limiting (429) errors using exponential backoff.
+    /// </summary>
+    /// <param name="directoryPath">The directory path to analyze.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The identified artist folder name (sanitized), or null if none found, error occurred, or heuristic disabled.</returns>
+    private async Task<string?> GetArtistFolderFromPathAsync(string directoryPath, CancellationToken cancellationToken)
+    {
+        if (_geminiModel == null || string.IsNullOrEmpty(directoryPath))
+        {
+            return null;
+        }
+
+        string prompt = string.Format(_geminiPromptTemplate, directoryPath);
+        int attempt = 0;
+        int totalDelayMs = 0;
+        int currentDelayMs = 1000; // Start with 1 second
+
+        while (attempt <= MaxGeminiRetries && totalDelayMs < MaxGeminiTotalRetryDelaySeconds * 1000 && !cancellationToken.IsCancellationRequested)
+        {
+            attempt++;
+            try
+            {
+                _logger.LogDebug("Calling Gemini API (Attempt {Attempt}/{MaxAttempts}) for path: {Path}", attempt, MaxGeminiRetries + 1, directoryPath);
+                var response = await _geminiModel.GenerateContent(prompt, cancellationToken: cancellationToken);
+
+                if (response == null || string.IsNullOrWhiteSpace(response.Text))
+                {
+                    _logger.LogWarning("Gemini API returned null or empty response for path: {Path}", directoryPath);
+                    return null; // Treat empty response as failure/None
+                }
+
+                var rawResponseText = response.Text;
+                 _logger.LogDebug("Gemini Raw Response: '{Response}'", rawResponseText);
+
+                // Sanitize output
+                var sanitizedResponse = rawResponseText.Trim().Trim('`', '"', '\'', '(', ')', '.');
+
+                if (sanitizedResponse.Equals("None", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogInformation("Gemini identified no specific artist folder for path: {Path}", directoryPath);
+                    return null; // Explicit "None" means no artist found
+                }
+
+                if (string.IsNullOrWhiteSpace(sanitizedResponse))
+                {
+                     _logger.LogWarning("Gemini response was empty after sanitization for path: {Path}. Raw: '{Raw}'", directoryPath, rawResponseText);
+                     return null;
+                }
+
+                // Return the sanitized potential artist name
+                return sanitizedResponse;
+
+            }
+            catch (HttpRequestException httpEx)
+            {
+                _logger.LogWarning(httpEx, "HTTP Error calling Gemini API (Attempt {Attempt}). Status Code: {StatusCode}. Path: {Path}", attempt, httpEx.StatusCode, directoryPath);
+
+                if (httpEx.StatusCode == HttpStatusCode.TooManyRequests) // 429 Rate Limit
+                {
+                    if (attempt > MaxGeminiRetries || totalDelayMs >= MaxGeminiTotalRetryDelaySeconds * 1000)
+                    {
+                        _logger.LogError("Gemini rate limit exceeded and max retries ({MaxRetries}) or max delay ({MaxDelay}s) reached. Giving up for this path: {Path}", MaxGeminiRetries, MaxGeminiTotalRetryDelaySeconds, directoryPath);
+                        // Consider setting skipGeminiHeuristic = true at the caller level if needed
+                        return null;
+                    }
+
+                    _logger.LogInformation("Gemini rate limit hit. Waiting {DelayMs}ms before retry {RetryNum}/{MaxRetries}. Total delay so far: {TotalDelayMs}ms. Path: {Path}", currentDelayMs, attempt, MaxGeminiRetries, totalDelayMs, directoryPath);
+                    try
+                    {
+                        await Task.Delay(currentDelayMs, cancellationToken);
+                    }
+                    catch (OperationCanceledException) { throw; } // Propagate cancellation
+
+                    totalDelayMs += currentDelayMs;
+                    currentDelayMs = Math.Min(currentDelayMs * 2, 60000); // Exponential backoff up to 60s
+                }
+                else
+                {
+                    // Other HTTP error, don't retry immediately, treat as failure
+                    _logger.LogError("Non-retryable HTTP error from Gemini. Disabling heuristic for this user might be needed. Path: {Path}", directoryPath);
+                    return null;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogWarning("Gemini API call cancelled for path: {Path}", directoryPath);
+                throw; // Re-throw cancellation
+            }
+            catch (ArgumentNullException argEx)
+            {
+                 _logger.LogError(argEx, "Argument Null Exception calling Gemini API (likely prompt issue). Path: {Path}", directoryPath);
+                 return null; // Don't retry argument issues
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error calling Gemini API (Attempt {Attempt}). Path: {Path}", attempt, directoryPath);
+                // Could implement retry for transient non-HTTP errors here if desired, but for now, treat as failure.
+                return null;
+            }
+        } // End while loop
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+             _logger.LogWarning("Gemini API call cancelled after retries for path: {Path}", directoryPath);
+        }
+        else
+        {
+             _logger.LogError("Gemini API call failed after {Attempts} attempts. Giving up for path: {Path}", attempt, directoryPath);
+        }
+
+        return null; // Failed after retries or cancelled
+    }
+
 
         // --- Disconnect ---
         private async Task DisconnectGracefullyAsync()
@@ -859,8 +1140,9 @@ namespace Spotify.Slsk.Integration.Services
                 _logger.LogInformation("Disconnecting Soulseek client...");
                 try
                 {
+                    // No async disconnect method in Soulseek.NET client library?
                     _soulseekClient.Disconnect();
-                    await Task.Delay(250);
+                    await Task.Delay(250); // Give some time for cleanup?
                 }
                 catch (Exception ex)
                 {
@@ -873,37 +1155,19 @@ namespace Spotify.Slsk.Integration.Services
             }
         }
 
-    // *** CHANGE 1: Updated PreprocessForFuzzyMatch method ***
     /// <summary>
-    /// Preprocesses a string (filename or directory name, without extension) for fuzzy matching:
-    /// - Converts to lowercase.
-    /// - Removes content within parentheses () or square brackets [].
-    /// - Removes hyphens (-).
-    /// - Removes dots (.).
-    /// - Normalizes whitespace (collapses multiple spaces to single, trims).
-    /// - Removes the first word if it consists entirely of digits (e.g., track numbers).
+    /// Preprocesses a string (filename or directory name, without extension) for fuzzy matching.
     /// </summary>
-    /// <param name="s">The input string (expected to be without extension).</param>
-    /// <returns>The preprocessed string, or an empty string if the input was null/whitespace.</returns>
     private static string PreprocessForFuzzyMatch(string? s)
     {
         if (string.IsNullOrWhiteSpace(s)) return "";
 
         string processed = s.ToLowerInvariant(); // Lowercase first
+        processed = ParenthesesContentRegex.Replace(processed, ""); // Remove content within () and []
+        processed = processed.Replace("-", ""); // Remove hyphens
+        processed = processed.Replace(".", ""); // Remove dots
+        processed = Regex.Replace(processed, @"\s+", " ").Trim(); // Normalize whitespace
 
-        // Remove content within () and []
-        processed = ParenthesesContentRegex.Replace(processed, "");
-
-        // Remove hyphens
-        processed = processed.Replace("-", "");
-
-        // Remove dots
-        processed = processed.Replace(".", "");
-
-        // Normalize whitespace (important before splitting and for general matching)
-        processed = Regex.Replace(processed, @"\s+", " ").Trim();
-
-        // Check and remove the first word if it's all digits
         if (!string.IsNullOrEmpty(processed))
         {
             int firstSpaceIndex = processed.IndexOf(' ');
@@ -912,10 +1176,10 @@ namespace Spotify.Slsk.Integration.Services
             if (firstWord.Length > 0 && firstWord.All(char.IsDigit))
             {
                 processed = (firstSpaceIndex == -1) ? "" : processed.Substring(firstSpaceIndex + 1).TrimStart();
-                processed = processed.Trim();
+                processed = processed.Trim(); // Trim again after potential removal
             }
         }
-
+        // Normalize whitespace again in case removing first word left consecutive spaces
         processed = Regex.Replace(processed, @"\s+", " ").Trim();
 
         return processed;
@@ -923,7 +1187,6 @@ namespace Spotify.Slsk.Integration.Services
 
     /// <summary>
     /// Checks if a filename has an allowed audio extension.
-    /// Uses Path.GetExtension which is generally safe for this purpose.
     /// </summary>
     private static bool IsAllowedExtension(string filename)
     {
@@ -943,106 +1206,56 @@ namespace Spotify.Slsk.Integration.Services
 
     // --- Manual Path Parsing Helpers (using SoulseekSeparator) ---
 
-    /// <summary>
-    /// Manually extracts the filename part (after the last backslash) from a Soulseek path.
-    /// </summary>
-    /// <param name="path">The full Soulseek path.</param>
-    /// <returns>The filename, or the original path if no backslash is found, or empty string if path is null/empty.</returns>
     private static string GetFileNameManual(string? path)
     {
         if (string.IsNullOrEmpty(path)) return "";
         int lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator);
-        if (lastSeparatorIndex == -1)
-        {
-            return path;
-        }
-        if (lastSeparatorIndex >= path.Length - 1)
-        {
-             return "";
-        }
-        return path.Substring(lastSeparatorIndex + 1);
+        return (lastSeparatorIndex == -1) ? path : path.Substring(lastSeparatorIndex + 1);
     }
 
-    /// <summary>
-    /// Manually extracts the filename without the extension from a filename string.
-    /// Assumes 'filename' is just the file part, not the full path.
-    /// </summary>
-    /// <param name="filename">The filename (e.g., from GetFileNameManual).</param>
-    /// <returns>The filename without the last extension, or the original filename if no dot is found, or empty string if filename is null/empty.</returns>
     private static string GetFileNameWithoutExtensionManual(string? filename)
     {
         if (string.IsNullOrEmpty(filename)) return "";
         int lastDotIndex = filename.LastIndexOf('.');
-        if (lastDotIndex <= 0)
-        {
-            return filename;
-        }
-        return filename.Substring(0, lastDotIndex);
+        return (lastDotIndex <= 0) ? filename : filename.Substring(0, lastDotIndex);
     }
 
-    /// <summary>
-    /// Manually extracts the parent directory path (before the last backslash) from a Soulseek path.
-    /// </summary>
-    /// <param name="path">The full Soulseek path.</param>
-    /// <returns>The parent path, or null if no parent exists (root or single component).</returns>
     private static string? GetParentPathManual(string? path)
     {
         if (string.IsNullOrEmpty(path)) return null;
-        int lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator);
-        if (lastSeparatorIndex <= 0)
-        {
-            return null;
-        }
-        if (lastSeparatorIndex == path.Length - 1) {
-            lastSeparatorIndex = path.LastIndexOf(SoulseekSeparator, lastSeparatorIndex - 1);
-            if (lastSeparatorIndex < 0) return null;
-        }
-
-        return path.Substring(0, lastSeparatorIndex);
+        string tempPath = path.TrimEnd(SoulseekSeparator); // Handle trailing separator before finding parent
+        if (string.IsNullOrEmpty(tempPath)) return null;
+        int lastSeparatorIndex = tempPath.LastIndexOf(SoulseekSeparator);
+        if (lastSeparatorIndex < 0) return null; // No separator found, it's a root element
+        if (lastSeparatorIndex == 0) return null; // Parent is root, e.g., "\Folder" -> parent is root (null)
+        return tempPath.Substring(0, lastSeparatorIndex);
     }
 
-    /// <summary>
-    /// Manually extracts the last component of a Soulseek path (directory or filename).
-    /// Handles trailing slashes.
-    /// </summary>
-    /// <param name="path">The full Soulseek path.</param>
-    /// <returns>The last component of the path, or empty string if path is null/empty or just separators.</returns>
     private static string GetLastPathComponentManual(string? path)
     {
         if (string.IsNullOrEmpty(path)) return "";
         string trimmedPath = path.TrimEnd(SoulseekSeparator);
         if (string.IsNullOrEmpty(trimmedPath)) return "";
         int lastSeparatorIndex = trimmedPath.LastIndexOf(SoulseekSeparator);
-        if (lastSeparatorIndex == -1)
-        {
-            return trimmedPath;
-        }
-        return trimmedPath.Substring(lastSeparatorIndex + 1);
+        return (lastSeparatorIndex == -1) ? trimmedPath : trimmedPath.Substring(lastSeparatorIndex + 1);
     }
 
-
-    /// <summary>
-    /// Manually checks if 'childPath' is a direct child of 'parentPath' using SoulseekSeparator.
-    /// Uses Ordinal comparison (case-sensitive). Handles paths that might end with separators.
-    /// </summary>
     private static bool IsDirectChildManual(string parentPath, string childPath)
     {
         if (string.IsNullOrEmpty(parentPath) || string.IsNullOrEmpty(childPath)) return false;
 
+        // Normalize by removing trailing separators for comparison logic
         string normParent = parentPath.TrimEnd(SoulseekSeparator);
         string normChild = childPath.TrimEnd(SoulseekSeparator);
 
+        // Child must be longer than parent
         if (normChild.Length <= normParent.Length) return false;
 
-        // Handle root case: If normParent is empty, child must not contain separator
-        if (string.IsNullOrEmpty(normParent)) {
-            return !normChild.Contains(SoulseekSeparator);
-        }
-
-        // Normal case: Child must start with parent + separator
+        // Child must start with parent + separator
         if (!normChild.StartsWith(normParent + SoulseekSeparator, StringComparison.Ordinal)) return false;
 
-        // Ensure no more separators after the parent part
+        // Ensure no more separators after the parent part in the child path
+        // Start search *after* the expected separator following the parent path
         int nextSeparatorIndex = normChild.IndexOf(SoulseekSeparator, normParent.Length + 1);
         return nextSeparatorIndex == -1;
     }
