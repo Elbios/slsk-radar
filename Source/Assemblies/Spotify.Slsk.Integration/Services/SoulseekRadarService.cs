@@ -438,51 +438,63 @@ Now, analyze this path and provide only the required output:
                                             _logger.LogError(ex, "Failed to rename temporary file from '{Source}' to '{Dest}'. Skipping ID3.", tempFilePath, renamedTempFilePath);
                                         }
 
-                                        if (renameSuccess)
-                                        {
-                                            try
-                                            {
-                                                _logger.LogDebug("Extracting ID3 tags from RENAMED file: {RenamedPath}", renamedTempFilePath);
-                                                using var tagFile = TagLib.File.Create(renamedTempFilePath);
+										if (renameSuccess)
+										{
+											try
+											{
+												_logger.LogDebug("Extracting ID3 tags from RENAMED file: {RenamedPath}", renamedTempFilePath);
+												// This is the line that can throw various exceptions based on file content
+												using var tagFile = TagLib.File.Create(renamedTempFilePath);
 
-                                                string artist = tagFile.Tag.FirstPerformer ?? tagFile.Tag.FirstAlbumArtist ?? string.Empty;
-                                                string title = tagFile.Tag.Title ?? GetFileNameWithoutExtensionManual(GetFileNameManual(currentFullRemotePath)); // Fallback to filename
-                                                string album = tagFile.Tag.Album ?? string.Empty;
+												string artist = tagFile.Tag.FirstPerformer ?? tagFile.Tag.FirstAlbumArtist ?? string.Empty;
+												string title = tagFile.Tag.Title ?? GetFileNameWithoutExtensionManual(GetFileNameManual(currentFullRemotePath)); // Fallback to filename
+												string album = tagFile.Tag.Album ?? string.Empty;
 
-                                                if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title)) {
-                                                    _logger.LogWarning("ID3 Extraction Warning: Could not extract Artist or Title from {RenamedPath}. Skipping harvest.", renamedTempFilePath);
-                                                } else {
-                                                    // Check overall limit BEFORE adding to bag and incrementing counter
-                                                    if (successfulHarvests.Count < _options.OverallTrackLimit)
-                                                    {
-                                                        var harvestedInfo = new HarvestedFileInfo {
-                                                            Username = target.Username, RemoteFilePath = currentFullRemotePath,
-                                                            LocalTempPath = renamedTempFilePath, // Store path for potential later use? No, it gets deleted. Store null?
-                                                            Artist = artist.Trim(), Title = title.Trim(), Album = album.Trim(),
-                                                            FileSize = transferResult.Size
-                                                        };
-                                                        _logger.LogInformation("ID3 Extracted Successfully: {Info}", harvestedInfo);
-                                                        successfulHarvests.Add(harvestedInfo);
+												if (string.IsNullOrWhiteSpace(artist) && string.IsNullOrWhiteSpace(title)) {
+													_logger.LogWarning("ID3 Extraction Warning: Could not extract Artist or Title from {RenamedPath}. Skipping harvest.", renamedTempFilePath);
+												} else {
+													// Check overall limit BEFORE adding to bag and incrementing counter
+													if (successfulHarvests.Count < _options.OverallTrackLimit)
+													{
+														var harvestedInfo = new HarvestedFileInfo {
+															Username = target.Username, RemoteFilePath = currentFullRemotePath,
+															LocalTempPath = null, // Temp path is deleted, don't store it
+															Artist = artist.Trim(), Title = title.Trim(), Album = album.Trim(),
+															FileSize = transferResult.Size
+														};
+														_logger.LogInformation("ID3 Extracted Successfully: {Info}", harvestedInfo);
+														successfulHarvests.Add(harvestedInfo);
 
-                                                        // 6. Increment User Success Count only if added
-                                                        var newCount = userSuccessCounters.AddOrUpdate(target.Username, 1, (key, count) => count + 1);
-                                                        _logger.LogDebug("Incremented success count (incl. ID3) for {User} to {Count}/{Quota}", target.Username, newCount, perUserPickQuota);
+														// 6. Increment User Success Count only if added
+														var newCount = userSuccessCounters.AddOrUpdate(target.Username, 1, (key, count) => count + 1);
+														_logger.LogDebug("Incremented success count (incl. ID3) for {User} to {Count}/{Quota}", target.Username, newCount, perUserPickQuota);
 
-                                                        // Check if overall limit reached AFTER adding
-                                                        if (successfulHarvests.Count >= _options.OverallTrackLimit)
-                                                        {
-                                                            _logger.LogInformation("Overall track limit ({Limit}) reached during harvest. Signalling cancellation.", _options.OverallTrackLimit);
-                                                            overallCts.Cancel(); // Signal cancellation to stop other tasks
-                                                        }
-                                                    } else {
-                                                         _logger.LogDebug("Overall track limit reached before adding harvest for {User} - {File}", target.Username, Path.GetFileName(currentFullRemotePath));
-                                                    }
-                                                }
-                                            }
-                                            catch (CorruptFileException ex) { _logger.LogWarning(ex, "ID3 Extraction Failed (Corrupt File): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath); }
-                                            catch (UnsupportedFormatException ex) { _logger.LogWarning(ex, "ID3 Extraction Failed (Unsupported Format): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath); }
-                                            catch (Exception ex) { _logger.LogError(ex, "ID3 Extraction Failed (Unexpected Error): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath); }
-                                        }
+														// Check if overall limit reached AFTER adding
+														if (successfulHarvests.Count >= _options.OverallTrackLimit)
+														{
+															_logger.LogInformation("Overall track limit ({Limit}) reached during harvest. Signalling cancellation.", _options.OverallTrackLimit);
+															overallCts.Cancel(); // Signal cancellation to stop other tasks
+														}
+													} else {
+														 _logger.LogDebug("Overall track limit reached before adding harvest for {User} - {File}", target.Username, Path.GetFileName(currentFullRemotePath));
+													}
+												}
+											}
+											catch (CorruptFileException ex) {
+												_logger.LogWarning(ex, "ID3 Extraction Failed (Corrupt File): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath);
+											}
+											catch (UnsupportedFormatException ex) {
+												_logger.LogWarning(ex, "ID3 Extraction Failed (Unsupported Format): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath);
+											}
+											catch (ArgumentOutOfRangeException ex) {
+												// This often happens with malformed metadata within the file (e.g., invalid picture size/offset)
+												_logger.LogWarning(ex, "ID3 Extraction Failed (ArgumentOutOfRangeException - likely malformed internal metadata like embedded picture): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath);
+											}
+											catch (Exception ex) {
+												// Keep this for truly unexpected errors during ID3 processing
+												_logger.LogError(ex, "ID3 Extraction Failed (Unexpected Error): {User} - '{File}' from {RenamedPath}", target.Username, Path.GetFileName(currentFullRemotePath), renamedTempFilePath);
+											}
+										} // End if (renameSuccess)
                                     }
                                 }
                             }
