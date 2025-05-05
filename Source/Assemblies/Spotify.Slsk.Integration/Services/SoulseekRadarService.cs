@@ -143,7 +143,7 @@ namespace Spotify.Slsk.Integration.Services
                         }
                         else
                         {
-                            _logger.LogTrace(" -> Skipping {User}, only {Count} files (less than {Min})", resp.Username, stats.FileCount, MinShareSizeFiles);
+                            _logger.LogDebug(" -> Skipping {User}, only {Count} files (less than {Min})", resp.Username, stats.FileCount, MinShareSizeFiles);
                         }
                     }
                     catch (OperationCanceledException) when (!overallCts.IsCancellationRequested) { _logger.LogWarning(" -> Timeout fetching stats for {User}", resp.Username); }
@@ -274,7 +274,7 @@ namespace Spotify.Slsk.Integration.Services
                                     else { _logger.LogDebug("Download Final State: {User} - {File} -> {State} (Prev: {PrevState})", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.State, args.PreviousState); }
                                 },
                                 progressUpdated: args => { /* Logging as before */
-                                    _logger.LogTrace("Download Progress: {User} - {File} | {Percent:F1}% ({Bytes}/{TotalBytes}) @ {Speed:F1} kB/s", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.PercentComplete, args.Transfer.BytesTransferred, args.Transfer.Size, args.Transfer.AverageSpeed / 1024.0);
+                                    _logger.LogDebug("Download Progress: {User} - {File} | {Percent:F1}% ({Bytes}/{TotalBytes}) @ {Speed:F1} kB/s", args.Transfer.Username, Path.GetFileName(args.Transfer.Filename), args.Transfer.PercentComplete, args.Transfer.BytesTransferred, args.Transfer.Size, args.Transfer.AverageSpeed / 1024.0);
                                 }
                             );
 
@@ -560,15 +560,16 @@ namespace Spotify.Slsk.Integration.Services
         // --- Seed Context ---
         var seedPath = seedFileEntry.Filename;
         var seedFileNameOnly = GetFileNameManual(seedPath);
-        var seedParentDir = GetParentPathManual(seedPath);
+        var seedParentDir = GetParentPathManual(seedPath); // Nullable string
         var seedFileNameWithoutExtension = GetFileNameWithoutExtensionManual(seedFileNameOnly);
         // *** CHANGE 1: Use the enhanced PreprocessForFuzzyMatch function ***
         var preprocessedSeedFileName = PreprocessForFuzzyMatch(seedFileNameWithoutExtension);
 
-        _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir);
+        _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir ?? "<ROOT>");
         // *** CHANGE 1: Log the preprocessed seed name ***
         _logger.LogDebug(" -> Seed Filename for Matching (Preprocessed): '{PreprocessedSeedFile}'", preprocessedSeedFileName);
 
+        // Handle case where seed is in root or path parsing failed
         if (string.IsNullOrEmpty(seedParentDir))
         {
             // --- Root Directory Fallback ---
@@ -615,11 +616,12 @@ namespace Spotify.Slsk.Integration.Services
         var visitedDirs = new HashSet<string>();
         var pickedFromFileInDir = new HashSet<string>();
 
+        // Check if seed parent exists in browse results or locked dirs before pushing
         if (browseDirLookup.ContainsKey(seedParentDir) || lockedDirs.Contains(seedParentDir))
         {
              _logger.LogDebug("Starting traversal from seed parent directory: '{SeedParentDir}'", seedParentDir);
              traversalStack.Push(seedParentDir);
-             visitedDirs.Add(seedParentDir);
+             visitedDirs.Add(seedParentDir); // Mark seed parent as visited immediately
         }
         else
         {
@@ -632,84 +634,102 @@ namespace Spotify.Slsk.Integration.Services
             var currentDir = traversalStack.Pop();
             _logger.LogDebug("Traversal: Popped '{CurrentDir}' from stack. Stack size: {StackSize}", currentDir, traversalStack.Count);
 
-            // --- 1. Process Files (if not already picked from this dir) ---
-            if (pickedFromFileInDir.Contains(currentDir))
+            // *** BUG FIX START: Check if the current directory is the seed's parent directory ***
+            bool isSeedParentDirectory = currentDir.Equals(seedParentDir, StringComparison.Ordinal);
+            if (isSeedParentDirectory)
             {
-                _logger.LogTrace("Skipping file processing in directory '{CurrentDir}' as a file was already picked from it.", currentDir);
+                _logger.LogDebug("Skipping file processing in '{CurrentDir}' because it is the seed track's parent directory.", currentDir);
+                // We still want to process its children and potentially move up, so we DON'T skip the rest of the loop iteration.
             }
-            else if (lockedDirs.Contains(currentDir))
-            {
-                _logger.LogTrace("Skipping file processing in locked directory: {LockedDir}", currentDir);
-            }
-            else if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
-            {
-                _logger.LogDebug("Processing files in '{CurrentDir}'. Found {FileCount} files in browse data.", currentDir, currentDirEntry.Files.Count);
-                var filesInDir = currentDirEntry.Files
-                                    .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
-                                                && IsAllowedExtension(f.Filename)
-                                                && f.Size > 0 && f.Size <= fileSizeCapBytes)
-                                    .ToList();
-                _logger.LogDebug(" -> {Count} files meet extension/size criteria in '{CurrentDir}'.", filesInDir.Count, currentDir);
+            // *** BUG FIX END ***
 
-                Shuffle(filesInDir);
-
-                bool pickedThisDir = false;
-                foreach (var file in filesInDir)
+            // --- 1. Process Files (Only if NOT the seed parent dir and not already picked from) ---
+            if (!isSeedParentDirectory) // Only attempt file processing if it's NOT the seed parent
+            {
+                if (pickedFromFileInDir.Contains(currentDir))
                 {
-                    var fullPath = file.Filename;
-                    var currentFileNameOnly = GetFileNameManual(fullPath);
-                    var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
-                    // *** CHANGE 1: Preprocess current file name using the enhanced function ***
-                    var preprocessedCurrentFileName = PreprocessForFuzzyMatch(currentFileNameWithoutExtension);
+                    _logger.LogTrace("Skipping file processing in directory '{CurrentDir}' as a file was already picked from it.", currentDir);
+                }
+                else if (lockedDirs.Contains(currentDir))
+                {
+                    _logger.LogTrace("Skipping file processing in locked directory: {LockedDir}", currentDir);
+                }
+                else if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
+                {
+                    _logger.LogDebug("Processing files in '{CurrentDir}'. Found {FileCount} files in browse data.", currentDir, currentDirEntry.Files.Count);
+                    var filesInDir = currentDirEntry.Files
+                                        .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
+                                                    && IsAllowedExtension(f.Filename)
+                                                    && f.Size > 0 && f.Size <= fileSizeCapBytes)
+                                        .ToList();
+                    _logger.LogDebug(" -> {Count} files meet extension/size criteria in '{CurrentDir}'.", filesInDir.Count, currentDir);
 
-                    // *** CHANGE 1: Calculate similarity using preprocessed names & check for empty strings ***
-                    int fileSimilarity;
-                    if (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedCurrentFileName))
-                    {
-                        fileSimilarity = 0; // Treat as dissimilar if preprocessing empties a string
-                        _logger.LogTrace(" -> Preprocessing resulted in empty string for file '{FileName}' or seed. Forcing dissimilarity.", currentFileNameOnly);
-                    }
-                    else
-                    {
-                        fileSimilarity = Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedCurrentFileName);
-                    }
+                    Shuffle(filesInDir);
 
-                    // Log actual file similarity score
-                    _logger.LogTrace(" -> Checking file: '{FileName}' (Preprocessed: '{PreprocessedFile}') vs Seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Score}%",
-                        currentFileNameOnly, preprocessedCurrentFileName, preprocessedSeedFileName, fileSimilarity);
+                    bool pickedThisDir = false;
+                    foreach (var file in filesInDir)
+                    {
+                        var fullPath = file.Filename;
+                        var currentFileNameOnly = GetFileNameManual(fullPath);
+                        var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
+                        // *** CHANGE 1: Preprocess current file name using the enhanced function ***
+                        var preprocessedCurrentFileName = PreprocessForFuzzyMatch(currentFileNameWithoutExtension);
 
-                    if (fileSimilarity < SimilarityThreshold)
-                    {
-                        picks.Add(fullPath);
-                        pickedFromFileInDir.Add(currentDir);
-                        pickedThisDir = true;
-                        _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedPreprocessed}': {Score}% < {Threshold}%)",
-                            currentFileNameOnly, preprocessedSeedFileName, fileSimilarity, SimilarityThreshold);
-                        _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
-                        break; // Stop after one pick per directory
+                        // *** CHANGE 1: Calculate similarity using preprocessed names & check for empty strings ***
+                        int fileSimilarity;
+                        if (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedCurrentFileName))
+                        {
+                            fileSimilarity = 0; // Treat as dissimilar if preprocessing empties a string
+                            _logger.LogTrace(" -> Preprocessing resulted in empty string for file '{FileName}' or seed. Forcing dissimilarity.", currentFileNameOnly);
+                        }
+                        else
+                        {
+                            fileSimilarity = Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedCurrentFileName);
+                        }
+
+                        // Log actual file similarity score
+                        _logger.LogDebug(" -> Checking file: '{FileName}' (Preprocessed: '{PreprocessedFile}') vs Seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Score}%",
+                            currentFileNameOnly, preprocessedCurrentFileName, preprocessedSeedFileName, fileSimilarity);
+
+                        if (fileSimilarity < SimilarityThreshold)
+                        {
+                            picks.Add(fullPath);
+                            pickedFromFileInDir.Add(currentDir);
+                            pickedThisDir = true;
+                            _logger.LogDebug("Picked file: {FileName} (TokenSetRatio to seed '{SeedPreprocessed}': {Score}% < {Threshold}%)",
+                                currentFileNameOnly, preprocessedSeedFileName, fileSimilarity, SimilarityThreshold);
+                            _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
+                            break; // Stop after one pick per directory
+                        }
+                        else
+                        {
+                            // ADDED: Log skipped files due to similarity
+                            _logger.LogDebug(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)",
+                                currentFileNameOnly, fileSimilarity, SimilarityThreshold);
+                        }
                     }
-                    else
+                    _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file? {PickedStatus}", currentDir, pickedThisDir);
+
+                    if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
                     {
-                        // ADDED: Log skipped files due to similarity
-                        _logger.LogTrace(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)",
-                            currentFileNameOnly, fileSimilarity, SimilarityThreshold);
+                        _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
+                        break; // Exit while loop
                     }
                 }
-                _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file? {PickedStatus}", currentDir, pickedThisDir);
-
-                if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
+                else
                 {
-                    _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
-                    break; // Exit while loop
+                    _logger.LogTrace("Directory '{Dir}' not found in browse results or has null Files collection. Skipping file processing.", currentDir);
                 }
-            }
-            else
-            {
-                _logger.LogTrace("Directory '{Dir}' not found in browse results or has null Files collection. Skipping file processing.", currentDir);
-            }
-            // --- End File Processing ---
+            } // --- End File Processing (if !isSeedParentDirectory) ---
 
-            // --- 2. Process Child Directories ---
+            // Check again if limit reached or cancelled after potential file pick
+            if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
+            {
+                 _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested after file processing check. Stopping traversal.", maxPicks);
+                 break; // Exit while loop
+            }
+
+            // --- 2. Process Child Directories (Always do this, even for seed parent) ---
             _logger.LogDebug("Processing children of '{CurrentDir}'", currentDir);
             var potentialChildren = browseDirLookup.Keys
                 .Where(path => IsDirectChildManual(currentDir, path))
@@ -798,7 +818,7 @@ namespace Spotify.Slsk.Integration.Services
             {
                 // Action: Attempt to Go Up because no dissimilar children to explore from here.
                 _logger.LogDebug("Decision: No unvisited dissimilar children found for '{CurrentDir}'. Attempting to go up.", currentDir);
-                if (canGoUp)
+                if (canGoUp && parentDir != null) // Ensure parentDir is not null before checking visited
                 {
                     // Check visited before pushing parent to avoid loops/redundancy
                     if (!visitedDirs.Contains(parentDir))
@@ -1001,14 +1021,16 @@ namespace Spotify.Slsk.Integration.Services
 
     /// <summary>
     /// Manually checks if 'childPath' is a direct child of 'parentPath' using SoulseekSeparator.
+    /// Uses OrdinalIgnoreCase for comparison.
     /// </summary>
     private static bool IsDirectChildManual(string parentPath, string childPath)
     {
         if (string.IsNullOrEmpty(parentPath) || string.IsNullOrEmpty(childPath)) return false;
-        // Ensure child path is longer and starts with parent path + separator
-        if (childPath.Length > parentPath.Length + 1 && childPath.StartsWith(parentPath + SoulseekSeparator))
+        // Ensure child path is longer and starts with parent path + separator (case-insensitive)
+        if (childPath.Length > parentPath.Length + 1 && childPath.StartsWith(parentPath + SoulseekSeparator, StringComparison.Ordinal))
         {
             // Ensure there are no more separators after the parent part
+            // Start searching *after* the expected separator following the parent path
             int nextSeparatorIndex = childPath.IndexOf(SoulseekSeparator, parentPath.Length + 1);
             return nextSeparatorIndex == -1;
         }
