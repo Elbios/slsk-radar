@@ -34,9 +34,9 @@ namespace Spotify.Slsk.Integration.Services
         private const int SimilarityThreshold = 53;
         private static readonly HashSet<string> AllowedExtensions = new HashSet<string> { ".mp3", ".flac", ".m4a", ".ogg" };
 
-        // *** CHANGE 1: Regex for preprocessing ***
+        // Regex for removing content within parentheses or brackets
         private static readonly Regex ParenthesesContentRegex = new Regex(@"\[.*?\]|\(.*?\)", RegexOptions.Compiled);
-        private static readonly Regex DigitWordRegex = new Regex(@"\b\d+\b", RegexOptions.Compiled);
+        // Removed DigitWordRegex as specific first-word logic is now used in PreprocessForFuzzyMatch
 
         public SoulseekRadarService(
             ILogger<SoulseekRadarService> logger,
@@ -562,7 +562,7 @@ namespace Spotify.Slsk.Integration.Services
         var seedFileNameOnly = GetFileNameManual(seedPath);
         var seedParentDir = GetParentPathManual(seedPath);
         var seedFileNameWithoutExtension = GetFileNameWithoutExtensionManual(seedFileNameOnly);
-        // *** CHANGE 1: Use the enhanced Normalize function ***
+        // *** CHANGE 1: Use the enhanced PreprocessForFuzzyMatch function ***
         var preprocessedSeedFileName = PreprocessForFuzzyMatch(seedFileNameWithoutExtension);
 
         _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir);
@@ -659,7 +659,7 @@ namespace Spotify.Slsk.Integration.Services
                     var fullPath = file.Filename;
                     var currentFileNameOnly = GetFileNameManual(fullPath);
                     var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
-                    // *** CHANGE 1: Preprocess current file name ***
+                    // *** CHANGE 1: Preprocess current file name using the enhanced function ***
                     var preprocessedCurrentFileName = PreprocessForFuzzyMatch(currentFileNameWithoutExtension);
 
                     // *** CHANGE 1: Calculate similarity using preprocessed names & check for empty strings ***
@@ -733,7 +733,7 @@ namespace Spotify.Slsk.Integration.Services
                 }
 
                 var childDirNameOnly = GetLastPathComponentManual(childDir);
-                // *** CHANGE 1: Preprocess child dir name ***
+                // *** CHANGE 1: Preprocess child dir name using the enhanced function ***
                 var preprocessedChildDirName = PreprocessForFuzzyMatch(childDirNameOnly);
 
                 // *** CHANGE 1: Calculate similarity using preprocessed names & check for empty strings ***
@@ -756,8 +756,8 @@ namespace Spotify.Slsk.Integration.Services
                 {
                     // Similar child found - log it, mark visited, and CONTINUE to the next child.
                     // ADDED: Log ratio vs threshold explicitly
-                    _logger.LogDebug("Child directory '{ChildName}' is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed (Preprocessed: '{PreprocessedSeed}'). Marking visited, skipping descent.",
-                         childDirNameOnly, similarity, SimilarityThreshold, preprocessedSeedFileName);
+                    _logger.LogDebug("Child directory '{ChildName}' (preprocessed:{preprocessedChildDirName}) is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed (Preprocessed: '{PreprocessedSeed}'). Marking visited, skipping descent.",
+                         childDirNameOnly, preprocessedChildDirName, similarity, SimilarityThreshold, preprocessedSeedFileName);
                     visitedDirs.Add(childDir);
                     // Continue to the next child in the foreach loop
                 }
@@ -853,31 +853,52 @@ namespace Spotify.Slsk.Integration.Services
 
     // *** CHANGE 1: Updated PreprocessForFuzzyMatch method ***
     /// <summary>
-    /// Preprocesses a string for fuzzy matching:
+    /// Preprocesses a string (filename or directory name, without extension) for fuzzy matching:
     /// - Converts to lowercase.
     /// - Removes content within parentheses () or square brackets [].
-    /// - Removes standalone words consisting entirely of digits.
+    /// - Removes hyphens (-).
     /// - Removes dots (.).
-    /// - Normalizes whitespace (collapses multiple spaces, trims).
+    /// - Normalizes whitespace (collapses multiple spaces to single, trims).
+    /// - Removes the first word if it consists entirely of digits (e.g., track numbers).
     /// </summary>
-    /// <param name="s">The input string.</param>
+    /// <param name="s">The input string (expected to be without extension).</param>
     /// <returns>The preprocessed string, or an empty string if the input was null/whitespace.</returns>
     private static string PreprocessForFuzzyMatch(string? s)
     {
         if (string.IsNullOrWhiteSpace(s)) return "";
 
-        string processed = s.ToLowerInvariant();
+        string processed = s.ToLowerInvariant(); // Lowercase first
 
         // Remove content within () and []
         processed = ParenthesesContentRegex.Replace(processed, "");
 
-        // Remove standalone words consisting entirely of digits
-        processed = DigitWordRegex.Replace(processed, "");
+        // Remove hyphens
+        processed = processed.Replace("-", "");
 
         // Remove dots
         processed = processed.Replace(".", "");
 
-        // Normalize whitespace (replace multiple spaces/tabs/etc with single space, trim)
+        // Normalize whitespace (important before splitting and for general matching)
+        processed = Regex.Replace(processed, @"\s+", " ").Trim();
+
+        // Check and remove the first word if it's all digits
+        if (!string.IsNullOrEmpty(processed))
+        {
+            int firstSpaceIndex = processed.IndexOf(' ');
+            // Handle case where the string might contain only the digit word
+            string firstWord = (firstSpaceIndex == -1) ? processed : processed.Substring(0, firstSpaceIndex);
+
+            // Ensure the word is not empty before checking digits (e.g., if string started with space)
+            if (firstWord.Length > 0 && firstWord.All(char.IsDigit))
+            {
+                // Remove the first word (and the space after it, if any)
+                processed = (firstSpaceIndex == -1) ? "" : processed.Substring(firstSpaceIndex + 1).TrimStart();
+                // Re-trim the whole string in case removing the first word left issues, although Substring+TrimStart should handle leading space.
+                processed = processed.Trim();
+            }
+        }
+
+        // Final whitespace check (likely redundant after previous steps, but safe)
         processed = Regex.Replace(processed, @"\s+", " ").Trim();
 
         return processed;
