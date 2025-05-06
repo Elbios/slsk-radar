@@ -607,441 +607,530 @@ Now, analyze this path and provide only the required output:
             }
         }
 
-    /// <summary>
-    /// Crawls a user's share, picking related but different tracks, potentially using Gemini for artist diversity.
-    /// </summary>
-    private async Task<List<string>> CrawlAndPickAsync(
-        string username,
-        Soulseek.File seedFileEntry,
-        int maxPicks,
-        int maxGeminiCallsPerUser, // *** ADDED: Gemini call quota ***
-        CancellationToken cancellationToken)
-    {
-        var picks = new List<string>();
-        int geminiCallsMade = 0; // *** ADDED: Counter for Gemini calls ***
-        bool skipGeminiHeuristic = _geminiModel == null || maxGeminiCallsPerUser <= 0; // *** ADDED: Flag to disable Gemini for this user ***
-
-        _logger.LogDebug("Browsing share for {User} (seeking {MaxPicks} picks total, 1 per dir, timeout {T}s for browse, threshold {Threshold}%, Gemini Quota: {GeminiQuota})",
-            username, maxPicks, _options.PerPeerTimeoutSeconds, SimilarityThreshold, maxGeminiCallsPerUser);
-        BrowseResponse browse;
-        try
+        /// <summary>
+        /// Crawls a user's share, picking related but different tracks, potentially using Gemini for artist diversity.
+        /// Runs Gemini initially on the seed path and again after the first pick.
+        /// </summary>
+        private async Task<List<string>> CrawlAndPickAsync(
+            string username,
+            Soulseek.File seedFileEntry,
+            int maxPicks,
+            int maxGeminiCallsPerUser,
+            CancellationToken cancellationToken)
         {
-            browse = await _soulseekClient.BrowseAsync(username,
-               new BrowseOptions(responseTimeout: _options.PerPeerTimeoutSeconds * 1000),
-               cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-             _logger.LogWarning("Browse operation cancelled or timed out for {User}. IsCancellationRequested: {IsCancelled}", username, cancellationToken.IsCancellationRequested);
-             return picks;
-        }
-        catch (Exception ex) when (ex is UserOfflineException || ex is TimeoutException || ex is SoulseekClientException)
-        {
-            _logger.LogWarning("Failed to browse share for {User}: {Msg}", username, ex.Message);
-            return picks;
-        }
-        catch (Exception ex)
-        {
-             _logger.LogError(ex, "Unexpected error browsing share for {User}", username);
-             return picks;
-        }
+            var picks = new List<string>();
+            int geminiCallsMade = 0;
+            bool skipGeminiHeuristic = _geminiModel == null || maxGeminiCallsPerUser <= 0;
+            var excludedArtistPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        long fileSizeCapBytes = (long)_options.FileSizeCapMB * 1024 * 1024;
-
-        var browseDirLookup = browse.Directories?
-            .Where(d => d != null && !string.IsNullOrEmpty(d.Name))
-            .ToDictionary(d => d.Name, d => d, StringComparer.Ordinal);
-
-        if (browseDirLookup == null || !browseDirLookup.Any())
-        {
-             _logger.LogDebug("No directories returned from browse operation for {User}.", username);
-             return picks;
-        }
-
-        var lockedDirs = new HashSet<string>(browse.LockedDirectories?.Select(d => d.Name) ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
-
-        // --- Seed Context ---
-        if (seedFileEntry == null || string.IsNullOrEmpty(seedFileEntry.Filename)) {
-            _logger.LogError("Seed file entry or its filename is null/empty for user {User}. Cannot proceed with crawl.", username);
-            return picks;
-        }
-        var seedPath = seedFileEntry.Filename;
-        var seedFileNameOnly = GetFileNameManual(seedPath);
-        var seedParentDir = GetParentPathManual(seedPath);
-        var seedFileNameWithoutExtension = GetFileNameWithoutExtensionManual(seedFileNameOnly);
-        var preprocessedSeedFileName = PreprocessForFuzzyMatch(seedFileNameWithoutExtension);
-
-        _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir ?? "<ROOT>");
-        _logger.LogDebug(" -> Seed Filename for Matching (Preprocessed): '{PreprocessedSeedFile}'", preprocessedSeedFileName);
-
-        // Handle case where seed is in root or path parsing failed
-        if (string.IsNullOrEmpty(seedParentDir))
-        {
-             _logger.LogWarning("Seed track '{SeedFile}' appears to be in the root directory (or path parsing failed). Cannot perform relative traversal for {User}. Performing fallback pick.", seedFileNameOnly, username);
-             var fallbackPicks = browseDirLookup.Values
-                .Where(dir => dir.Files != null)
-                .SelectMany(dir => dir.Files.Select(f => new { DirectoryName = dir.Name, FileEntry = f }))
-                .Where(df => df.FileEntry != null && !string.IsNullOrEmpty(df.FileEntry.Filename)
-                         && IsAllowedExtension(df.FileEntry.Filename)
-                         && df.FileEntry.Size > 0 && df.FileEntry.Size <= fileSizeCapBytes)
-                .Select(df => {
-                     string potentialRelativeFileName = df.FileEntry.Filename;
-                     string reconstructedFullPath = potentialRelativeFileName.Contains(SoulseekSeparator)
-                        ? potentialRelativeFileName
-                        : df.DirectoryName + SoulseekSeparator + potentialRelativeFileName;
-                     return new {
-                        FullPath = reconstructedFullPath,
-                        PreprocessedName = PreprocessForFuzzyMatch(GetFileNameWithoutExtensionManual(GetFileNameManual(reconstructedFullPath)))
-                     };
-                 })
-                .Select(f => new {
-                    f.FullPath,
-                    Similarity = (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(f.PreprocessedName))
-                                    ? 0
-                                    : Fuzz.TokenSetRatio(preprocessedSeedFileName, f.PreprocessedName)
-                })
-                .Where(f => f.Similarity < SimilarityThreshold)
-                .OrderBy(f => f.Similarity)
-                .Take(maxPicks)
-                .Select(f => f.FullPath)
-                .ToList();
-
-             if (fallbackPicks.Any()) {
-                 _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}%):",
-                    fallbackPicks.Count, maxPicks, SimilarityThreshold);
-                 foreach(var pick in fallbackPicks) {
-                     _logger.LogDebug(" -> Fallback Pick: {FullPickPath}", pick);
-                     picks.Add(pick);
-                 }
-             } else {
-                 _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}%).", SimilarityThreshold);
-             }
-             return picks;
-        }
-
-        // --- Traversal Logic ---
-        var traversalStack = new Stack<string>();
-        var visitedDirs = new HashSet<string>(StringComparer.Ordinal);
-        var pickedFromFileInDir = new HashSet<string>(StringComparer.Ordinal);
-
-        if (browseDirLookup.ContainsKey(seedParentDir) || lockedDirs.Contains(seedParentDir))
-        {
-             _logger.LogDebug("Starting traversal from seed parent directory: '{SeedParentDir}'", seedParentDir);
-             traversalStack.Push(seedParentDir);
-             visitedDirs.Add(seedParentDir);
-        }
-        else
-        {
-             _logger.LogWarning("Seed parent directory '{SeedParentDir}' not found in browse results or locked directories for {User}. Cannot start traversal.", seedParentDir, username);
-             return picks;
-        }
-
-        while (traversalStack.Count > 0 && picks.Count < maxPicks && !cancellationToken.IsCancellationRequested)
-        {
-            var currentDir = traversalStack.Pop();
-            _logger.LogDebug("Traversal: Popped '{CurrentDir}' from stack. Stack size: {StackSize}", currentDir, traversalStack.Count);
-
-            bool isSeedParentDirectory = currentDir.Equals(seedParentDir, StringComparison.Ordinal);
-            if (isSeedParentDirectory)
+            _logger.LogDebug("Browsing share for {User} (seeking {MaxPicks} picks total, 1 per dir, timeout {T}s for browse, threshold {Threshold}%, Gemini Quota: {GeminiQuota})",
+                username, maxPicks, _options.PerPeerTimeoutSeconds, SimilarityThreshold, maxGeminiCallsPerUser);
+            BrowseResponse browse;
+            try
             {
-                _logger.LogDebug("Skipping file processing in '{CurrentDir}' because it is the seed track's parent directory.", currentDir);
+                browse = await _soulseekClient.BrowseAsync(username,
+                   new BrowseOptions(responseTimeout: _options.PerPeerTimeoutSeconds * 1000),
+                   cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                 _logger.LogWarning("Browse operation cancelled or timed out for {User}. IsCancellationRequested: {IsCancelled}", username, cancellationToken.IsCancellationRequested);
+                 return picks;
+            }
+            catch (Exception ex) when (ex is UserOfflineException || ex is TimeoutException || ex is SoulseekClientException)
+            {
+                _logger.LogWarning("Failed to browse share for {User}: {Msg}", username, ex.Message);
+                return picks;
+            }
+            catch (Exception ex)
+            {
+                 _logger.LogError(ex, "Unexpected error browsing share for {User}", username);
+                 return picks;
             }
 
-            // --- 1. Process Files (Only if NOT the seed parent dir and not already picked from) ---
-            bool pickedThisIteration = false; // Track if a pick happened in *this* iteration
-            if (!isSeedParentDirectory && !pickedFromFileInDir.Contains(currentDir) && !lockedDirs.Contains(currentDir))
+            long fileSizeCapBytes = (long)_options.FileSizeCapMB * 1024 * 1024;
+
+            var browseDirLookup = browse.Directories?
+                .Where(d => d != null && !string.IsNullOrEmpty(d.Name))
+                .ToDictionary(d => d.Name, d => d, StringComparer.Ordinal);
+
+            if (browseDirLookup == null || !browseDirLookup.Any())
             {
-                 if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
+                 _logger.LogDebug("No directories returned from browse operation for {User}.", username);
+                 return picks;
+            }
+
+            var lockedDirs = new HashSet<string>(browse.LockedDirectories?.Select(d => d.Name) ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+
+            // --- Seed Context ---
+            if (seedFileEntry == null || string.IsNullOrEmpty(seedFileEntry.Filename)) {
+                _logger.LogError("Seed file entry or its filename is null/empty for user {User}. Cannot proceed with crawl.", username);
+                return picks;
+            }
+            var seedPath = seedFileEntry.Filename;
+            var seedFileNameOnly = GetFileNameManual(seedPath);
+            var seedParentDir = GetParentPathManual(seedPath); // This can be null if seed is at root
+            var seedFileNameWithoutExtension = GetFileNameWithoutExtensionManual(seedFileNameOnly);
+            var preprocessedSeedFileName = PreprocessForFuzzyMatch(seedFileNameWithoutExtension);
+
+            _logger.LogDebug("Raw Seed Context: Path='{P}', Extracted FileName='{FN}', Extracted ParentDir='{PD}'", seedPath, seedFileNameOnly, seedParentDir ?? "<ROOT>");
+            _logger.LogDebug(" -> Seed Filename for Matching (Preprocessed): '{PreprocessedSeedFile}'", preprocessedSeedFileName);
+
+
+            // --- Initial Gemini Call for Seed Artist ---
+            string? validatedSeedArtistPath = null; // Store the validated path if found
+            if (!skipGeminiHeuristic && geminiCallsMade < maxGeminiCallsPerUser && !string.IsNullOrEmpty(seedParentDir))
+            {
+                _logger.LogInformation("Gemini Trigger: Initial check for seed artist in path: '{Path}' (Call {CallNum}/{MaxCalls})",
+                    seedParentDir, geminiCallsMade + 1, maxGeminiCallsPerUser);
+
+                string? seedArtistFolderName = await GetArtistFolderFromPathAsync(seedParentDir, cancellationToken);
+                geminiCallsMade++;
+
+                if (seedArtistFolderName != null)
                 {
-                    _logger.LogDebug("Processing files in '{CurrentDir}'. Found {FileCount} files in browse data.", currentDir, currentDirEntry.Files.Count);
-                    var filesInDir = currentDirEntry.Files
-                                        .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
-                                                    && IsAllowedExtension(f.Filename)
-                                                    && f.Size > 0 && f.Size <= fileSizeCapBytes)
-                                        .ToList();
-                    _logger.LogDebug(" -> {Count} files meet extension/size criteria in '{CurrentDir}'.", filesInDir.Count, currentDir);
+                    _logger.LogInformation("Gemini Initial Response for '{Path}': Identified '{ArtistFolder}' as potential seed artist folder.", seedParentDir, seedArtistFolderName);
+                    // *** MODIFIED: Store the validated path ***
+                    validatedSeedArtistPath = ValidateAndGetFullPathForArtistFolder(seedParentDir, seedArtistFolderName);
 
-                    Shuffle(filesInDir);
-
-                    foreach (var file in filesInDir)
+                    if (validatedSeedArtistPath != null)
                     {
-                        if (string.IsNullOrEmpty(file.Filename)) {
-                            _logger.LogWarning("Skipping file entry with null/empty filename in directory '{CurrentDir}'", currentDir);
-                            continue;
-                        }
-
-                        string potentialRelativeFileName = file.Filename;
-                        string reconstructedFullPath;
-                        if (potentialRelativeFileName.Contains(SoulseekSeparator))
-                        {
-                            reconstructedFullPath = potentialRelativeFileName;
-                            _logger.LogTrace(" -> File entry '{FileName}' in dir '{CurrentDir}' seems to contain a separator; using as-is.", potentialRelativeFileName, currentDir);
-                        }
-                        else
-                        {
-                            reconstructedFullPath = currentDir + SoulseekSeparator + potentialRelativeFileName;
-                            _logger.LogTrace(" -> Reconstructing full path: '{CurrentDir}' + '{FileName}' = '{FullPath}'", currentDir, potentialRelativeFileName, reconstructedFullPath);
-                        }
-
-                        var currentFileNameOnly = GetFileNameManual(reconstructedFullPath);
-                        var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
-                        var preprocessedCurrentFileName = PreprocessForFuzzyMatch(currentFileNameWithoutExtension);
-
-                        int fileSimilarity;
-                        if (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedCurrentFileName))
-                        {
-                            fileSimilarity = 0;
-                            _logger.LogTrace(" -> Preprocessing resulted in empty string for file '{FileName}' or seed. Forcing dissimilarity.", currentFileNameOnly);
-                        }
-                        else
-                        {
-                            fileSimilarity = Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedCurrentFileName);
-                        }
-
-                        _logger.LogDebug(" -> Checking file: '{FileName}' (Preprocessed: '{PreprocessedFile}') vs Seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Score}%",
-                            currentFileNameOnly, preprocessedCurrentFileName, preprocessedSeedFileName, fileSimilarity);
-
-                        if (fileSimilarity < SimilarityThreshold)
-                        {
-                            picks.Add(reconstructedFullPath);
-                            pickedFromFileInDir.Add(currentDir);
-                            pickedThisIteration = true; // Mark that a pick happened
-                            _logger.LogDebug("Picked file: {FileName} (Full Path: '{FullPath}', TokenSetRatio to seed '{SeedPreprocessed}': {Score}% < {Threshold}%)",
-                                currentFileNameOnly, reconstructedFullPath, preprocessedSeedFileName, fileSimilarity, SimilarityThreshold);
-                            _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
-
-                            // *** ADDED: Gemini Artist Heuristic Trigger ***
-                            if (!skipGeminiHeuristic && geminiCallsMade < maxGeminiCallsPerUser)
-                            {
-                                geminiCallsMade++;
-                                _logger.LogInformation("Gemini Trigger: First pick from user {User}. Calling Gemini to identify artist in path: '{Path}' (Call {CallNum}/{MaxCalls})",
-                                    username, currentDir, geminiCallsMade, maxGeminiCallsPerUser);
-
-                                string? artistFolderName = await GetArtistFolderFromPathAsync(currentDir, cancellationToken);
-
-                                if (artistFolderName != null)
-                                {
-                                    _logger.LogInformation("Gemini Response for '{Path}': Identified '{ArtistFolder}' as potential artist folder.", currentDir, artistFolderName);
-
-                                    // Validate and find the actual path component
-                                    string[] pathComponents = currentDir.Split(SoulseekSeparator);
-                                    int artistIndex = -1;
-                                    for(int i = 0; i < pathComponents.Length; i++)
-                                    {
-                                        // Use OrdinalIgnoreCase for robustness against casing variations, though prompt asks for exact.
-                                        if (pathComponents[i].Equals(artistFolderName, StringComparison.OrdinalIgnoreCase))
-                                        {
-                                            artistIndex = i;
-                                            break;
-                                        }
-                                    }
-
-                                    if (artistIndex != -1)
-                                    {
-                                        string validatedArtistFolderName = pathComponents[artistIndex]; // Use the actual casing from the path
-                                        string artistFolderPath = string.Join(SoulseekSeparator.ToString(), pathComponents.Take(artistIndex + 1));
-                                        string? artistParentPath = (artistIndex == 0) ? null : string.Join(SoulseekSeparator.ToString(), pathComponents.Take(artistIndex));
-
-                                        _logger.LogInformation("Gemini Action: Validated artist folder '{ArtistFolder}' found at path '{ArtistPath}'. Redirecting traversal.",
-                                            validatedArtistFolderName, artistFolderPath);
-
-                                        // *** MODIFIED: Clear stack AND reset visitedDirs appropriately ***
-                                        traversalStack.Clear();
-                                        _logger.LogDebug(" -> Cleared traversal stack.");
-
-                                        // Reset visitedDirs, keeping only essential ones
-                                        var newVisitedDirs = new HashSet<string>(StringComparer.Ordinal);
-                                        if (!string.IsNullOrEmpty(seedParentDir))
-                                        {
-                                            newVisitedDirs.Add(seedParentDir); // Keep seed parent visited
-                                            _logger.LogTrace(" -> Preserving seed parent '{Dir}' in new visited set.", seedParentDir);
-                                        }
-                                        newVisitedDirs.Add(currentDir); // Keep the directory where the pick happened visited
-                                        _logger.LogTrace(" -> Preserving picked directory '{Dir}' in new visited set.", currentDir);
-                                        newVisitedDirs.Add(artistFolderPath); // Keep the identified artist folder visited
-                                        _logger.LogTrace(" -> Preserving artist directory '{Dir}' in new visited set.", artistFolderPath);
-
-                                        visitedDirs = newVisitedDirs; // Replace old set with the new one
-                                        _logger.LogDebug(" -> Reset visitedDirs set, preserving essential paths. New size: {Count}", visitedDirs.Count);
-
-
-                                        // Push the parent onto the cleared stack if valid
-                                        if (!string.IsNullOrEmpty(artistParentPath) && (browseDirLookup.ContainsKey(artistParentPath) || lockedDirs.Contains(artistParentPath)))
-                                        {
-                                            if (!visitedDirs.Contains(artistParentPath)) // Check the *new* visited set
-                                            {
-                                                traversalStack.Push(artistParentPath);
-                                                visitedDirs.Add(artistParentPath); // Add parent to visited *now*
-                                                _logger.LogInformation(" -> Pushing parent '{ParentPath}' onto stack to continue search above artist level. Added to visited.", artistParentPath);
-                                            }
-                                            else
-                                            {
-                                                 _logger.LogDebug(" -> Parent '{ParentPath}' was already in the essential preserved set (e.g., was seed parent). Not pushing again.", artistParentPath);
-                                            }
-                                        }
-                                        else
-                                        {
-                                            _logger.LogInformation(" -> Artist folder '{ArtistFolder}' has no valid parent or is at root. Traversal will stop unless stack had prior entries (unlikely after clear).", validatedArtistFolderName);
-                                        }
-                                        // Break file loop and let the main while loop re-evaluate with the modified stack/visited
-                                        goto EndFileProcessing;
-                                    }
-                                    else
-                                    {
-                                        _logger.LogWarning("Gemini Validation Failed: Folder '{ArtistFolder}' returned by Gemini not found as a component in path '{Path}'. Disabling heuristic for this user.",
-                                            artistFolderName, currentDir);
-                                        skipGeminiHeuristic = true;
-                                    }
-                                }
-                                else
-                                {
-                                    // Gemini returned "None" or an error occurred (handled in GetArtistFolderFromPathAsync)
-                                    _logger.LogInformation("Gemini Response for '{Path}': No specific artist folder identified or error occurred. Continuing standard traversal.", currentDir);
-                                    // If an error occurred, GetArtistFolderFromPathAsync might have already set skipGeminiHeuristic
-                                    if (artistFolderName == null && !cancellationToken.IsCancellationRequested) // Check if it was an error vs "None"
-                                    {
-                                         // Assume error if null was returned without cancellation
-                                         // skipGeminiHeuristic = true; // Let GetArtistFolderFromPathAsync handle this based on retry outcome
-                                    }
-                                }
-                            }
-                            // *** END Gemini Section ***
-
-                            break; // Stop after one pick per directory
-                        }
-                        else
-                        {
-                            _logger.LogDebug(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)",
-                                currentFileNameOnly, fileSimilarity, SimilarityThreshold);
-                        }
-                    } // End foreach file
-                    EndFileProcessing:; // Label for goto
-                    _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file this iteration? {PickedStatus}", currentDir, pickedThisIteration);
-                }
-                else
-                {
-                    _logger.LogTrace("Directory '{Dir}' not found in browse results or has null Files collection. Skipping file processing.", currentDir);
-                }
-            } // --- End File Processing Check ---
-
-            // Check limits / cancellation *after* potential Gemini stack modification
-            if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
-            {
-                 _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
-                 break;
-            }
-
-            // If Gemini modified the stack, we want the while loop to immediately process the new top item (the parent)
-            if (pickedThisIteration && !skipGeminiHeuristic && traversalStack.Count > 0) {
-                 _logger.LogDebug("Gemini heuristic potentially modified stack and pushed parent. Continuing to next iteration of while loop.");
-                 continue; // Skip child processing for currentDir, process the parent pushed by Gemini
-            }
-
-
-            // --- 2. Process Child Directories ---
-            _logger.LogDebug("Processing children of '{CurrentDir}'", currentDir);
-            var potentialChildren = browseDirLookup.Keys
-                .Concat(lockedDirs)
-                .Where(path => IsDirectChildManual(currentDir, path))
-                .Distinct(StringComparer.Ordinal)
-                .ToList();
-
-            _logger.LogDebug(" -> Found {Count} potential child directories for '{CurrentDir}'.", potentialChildren.Count, currentDir);
-
-            Shuffle(potentialChildren);
-
-            var dissimilarChildrenToPush = new List<string>();
-
-            foreach (var childDir in potentialChildren)
-            {
-                if (visitedDirs.Contains(childDir))
-                {
-                    _logger.LogTrace("Child '{ChildDir}' already visited. Skipping.", childDir);
-                    continue;
-                }
-
-                var childDirNameOnly = GetLastPathComponentManual(childDir);
-                var preprocessedChildDirName = PreprocessForFuzzyMatch(childDirNameOnly);
-
-                int similarity;
-                if (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedChildDirName))
-                {
-                    similarity = 0;
-                    _logger.LogTrace(" -> Preprocessing resulted in empty string for dir '{DirName}' or seed. Forcing dissimilarity.", childDirNameOnly);
-                }
-                else
-                {
-                    similarity = Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedChildDirName);
-                }
-
-                _logger.LogTrace("Checking child dir '{ChildName}' (Preprocessed: '{PreprocessedChild}') against seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Similarity}%",
-                    childDirNameOnly, preprocessedChildDirName, preprocessedSeedFileName, similarity);
-
-                if (similarity >= SimilarityThreshold)
-                {
-                    _logger.LogDebug("Child directory '{ChildName}' (preprocessed:{preprocessedChildDirName}) is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed (Preprocessed: '{PreprocessedSeed}'). Marking visited, skipping descent.",
-                         childDirNameOnly, preprocessedChildDirName, similarity, SimilarityThreshold, preprocessedSeedFileName);
-                    visitedDirs.Add(childDir);
-                }
-                else
-                {
-                     _logger.LogTrace("Child directory '{ChildName}' is DISSIMILAR (TokenSetRatio: {Similarity}% < {Threshold}%). Adding to potential exploration list.", childDirNameOnly, similarity, SimilarityThreshold);
-                    dissimilarChildrenToPush.Add(childDir);
-                }
-            } // --- End foreach childDir ---
-
-            // --- 3. Decide Traversal Action ---
-            var parentDir = GetParentPathManual(currentDir);
-            bool canGoUp = !string.IsNullOrEmpty(parentDir)
-                        && (browseDirLookup.ContainsKey(parentDir) || lockedDirs.Contains(parentDir));
-
-            if (dissimilarChildrenToPush.Any())
-            {
-                _logger.LogDebug("Decision: Found {Count} dissimilar children for '{CurrentDir}'. Pushing them onto stack. Stack size before push: {StackSize}",
-                    dissimilarChildrenToPush.Count, currentDir, traversalStack.Count);
-				// Push the dissimilar children in the order they were found (which is based on the shuffled potentialChildren list)
-				foreach (var dissimilarChild in dissimilarChildrenToPush) // REMOVED OrderBy
-				{
-					if (!visitedDirs.Contains(dissimilarChild))
-					{
-						traversalStack.Push(dissimilarChild);
-						visitedDirs.Add(dissimilarChild);
-						 _logger.LogTrace(" -> Pushed dissimilar child: {ChildDir}", dissimilarChild);
-					} else {
-						 _logger.LogTrace(" -> Skipping push of dissimilar child {ChildDir} as it became visited.", dissimilarChild);
-					}
-				}
-                _logger.LogDebug(" -> Stack size after pushing dissimilar children: {StackSize}", traversalStack.Count);
-            }
-            else // No dissimilar children to explore downwards
-            {
-                _logger.LogDebug("Decision: No unvisited dissimilar children found for '{CurrentDir}'. Attempting to go up.", currentDir);
-                if (canGoUp && parentDir != null)
-                {
-                    if (!visitedDirs.Contains(parentDir))
+                        _logger.LogInformation("Gemini Initial Action: Validated seed artist folder '{ArtistFolder}' found at path '{ArtistPath}'. Adding to excluded paths.",
+                            seedArtistFolderName, validatedSeedArtistPath);
+                        excludedArtistPaths.Add(validatedSeedArtistPath);
+                    }
+                    else
                     {
-                        _logger.LogDebug(" -> Can go up. Pushing parent '{ParentDir}' onto stack. Stack size: {StackSize}", parentDir, traversalStack.Count + 1);
-                        traversalStack.Push(parentDir);
-                        visitedDirs.Add(parentDir);
-                    } else {
-                       _logger.LogTrace(" -> Parent '{ParentDir}' already visited, not pushing again.", parentDir);
+                        _logger.LogWarning("Gemini Initial Validation Failed: Folder '{ArtistFolder}' returned by Gemini not found as a component in seed path '{Path}'.",
+                            seedArtistFolderName, seedParentDir);
                     }
                 }
                 else
                 {
-                    _logger.LogDebug(" -> Cannot go up from '{CurrentDir}'. No parent, parent not in browse/locked results, or parent already visited. Ending branch exploration.", currentDir);
+                    _logger.LogInformation("Gemini Initial Response for '{Path}': No specific seed artist folder identified or error occurred.", seedParentDir);
                 }
             }
-        } // --- End while loop ---
+            else if (string.IsNullOrEmpty(seedParentDir))
+            {
+                _logger.LogDebug("Skipping initial Gemini seed artist check because seed parent directory is null or root.");
+            }
+            else if (skipGeminiHeuristic || geminiCallsMade >= maxGeminiCallsPerUser)
+            {
+                 _logger.LogDebug("Skipping initial Gemini seed artist check (Heuristic disabled or quota met).");
+            }
+            // --- END Initial Gemini Call ---
 
-        if (cancellationToken.IsCancellationRequested)
-        {
-             _logger.LogWarning("Crawl for {User} was cancelled during traversal.", username);
+
+            // Handle case where seed is in root or path parsing failed (Fallback Logic)
+            if (string.IsNullOrEmpty(seedParentDir))
+            {
+                 _logger.LogWarning("Seed track '{SeedFile}' appears to be in the root directory (or path parsing failed). Cannot perform relative traversal for {User}. Performing fallback pick.", seedFileNameOnly, username);
+                 // ... (Fallback logic remains unchanged, including the check against excludedArtistPaths) ...
+                 var fallbackPicks = browseDirLookup.Values
+                    .Where(dir => dir.Files != null)
+                    .SelectMany(dir => dir.Files.Select(f => new { DirectoryName = dir.Name, FileEntry = f }))
+                    .Where(df => df.FileEntry != null && !string.IsNullOrEmpty(df.FileEntry.Filename)
+                             && IsAllowedExtension(df.FileEntry.Filename)
+                             && df.FileEntry.Size > 0 && df.FileEntry.Size <= fileSizeCapBytes
+                             && (string.IsNullOrEmpty(df.DirectoryName) || !excludedArtistPaths.Any(excluded => df.DirectoryName.StartsWith(excluded, StringComparison.OrdinalIgnoreCase)))
+                             )
+                    .Select(df => {
+                         string potentialRelativeFileName = df.FileEntry.Filename;
+                         string reconstructedFullPath = potentialRelativeFileName.Contains(SoulseekSeparator)
+                            ? potentialRelativeFileName
+                            : df.DirectoryName + SoulseekSeparator + potentialRelativeFileName;
+                         return new {
+                            FullPath = reconstructedFullPath,
+                            PreprocessedName = PreprocessForFuzzyMatch(GetFileNameWithoutExtensionManual(GetFileNameManual(reconstructedFullPath)))
+                         };
+                     })
+                    .Select(f => new {
+                        f.FullPath,
+                        Similarity = (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(f.PreprocessedName))
+                                        ? 0
+                                        : Fuzz.TokenSetRatio(preprocessedSeedFileName, f.PreprocessedName)
+                    })
+                    .Where(f => f.Similarity < SimilarityThreshold)
+                    .OrderBy(f => f.Similarity)
+                    .Take(maxPicks)
+                    .Select(f => f.FullPath)
+                    .ToList();
+
+                 if (fallbackPicks.Any()) {
+                     _logger.LogDebug("Falling back to picking {Count} files from browse results (overall limit {Limit}, similarity < {Threshold}%, excluding {ExcludedCount} artist paths):",
+                        fallbackPicks.Count, maxPicks, SimilarityThreshold, excludedArtistPaths.Count);
+                     foreach(var pick in fallbackPicks) {
+                         _logger.LogDebug(" -> Fallback Pick: {FullPickPath}", pick);
+                         picks.Add(pick);
+                     }
+                 } else {
+                     _logger.LogDebug("Fallback picking yielded no results (similarity < {Threshold}%, excluded {ExcludedCount} artist paths).", SimilarityThreshold, excludedArtistPaths.Count);
+                 }
+                 return picks;
+            }
+
+            // --- Traversal Setup ---
+            var traversalStack = new Stack<string>();
+            var visitedDirs = new HashSet<string>(StringComparer.Ordinal); // Tracks visited dirs for traversal path
+            var pickedFromFileInDir = new HashSet<string>(StringComparer.Ordinal); // Tracks dirs we picked a file from
+
+            // *** MODIFIED: Determine the ACTUAL starting point for traversal ***
+
+            // First, mark essential paths as visited *before* deciding the start point
+            visitedDirs.Add(seedParentDir); // Always mark seed parent visited initially
+            foreach (var excludedPath in excludedArtistPaths)
+            {
+                if (visitedDirs.Add(excludedPath)) // Add returns true if it was added
+                {
+                    _logger.LogDebug(" -> Preemptively marked initially identified seed artist path '{Path}' as visited.", excludedPath);
+                }
+            }
+
+            string? initialStackPushDir = null; // The directory to actually push onto the stack first
+            bool seedParentIsUnderExcludedArtistPath = validatedSeedArtistPath != null &&
+                                                      (seedParentDir.Equals(validatedSeedArtistPath, StringComparison.OrdinalIgnoreCase) ||
+                                                       seedParentDir.StartsWith(validatedSeedArtistPath + SoulseekSeparator, StringComparison.OrdinalIgnoreCase));
+
+            if (seedParentIsUnderExcludedArtistPath)
+            {
+                // The normal starting point is inside the excluded zone. Try to start from the parent of the excluded zone.
+                _logger.LogInformation("Seed parent '{SeedParent}' is within the excluded artist path '{ArtistPath}'. Attempting to start traversal from artist path's parent.", seedParentDir, validatedSeedArtistPath);
+                string? artistParent = GetParentPathManual(validatedSeedArtistPath!); // Use ! as validatedSeedArtistPath is non-null here
+
+                if (!string.IsNullOrEmpty(artistParent))
+                {
+                    // Check if this calculated parent exists and hasn't already been visited (e.g., if it was somehow also excluded)
+                    if ((browseDirLookup.ContainsKey(artistParent) || lockedDirs.Contains(artistParent)) && !visitedDirs.Contains(artistParent))
+                    {
+                        initialStackPushDir = artistParent;
+                        _logger.LogDebug(" -> Will start traversal from artist parent: '{ArtistParent}'", artistParent);
+                    }
+                    else if (visitedDirs.Contains(artistParent))
+                    {
+                         _logger.LogWarning(" -> Artist parent '{ArtistParent}' is already visited/excluded. Cannot start traversal from there.", artistParent);
+                    }
+                    else
+                    {
+                         _logger.LogWarning(" -> Artist parent '{ArtistParent}' not found in browse/locked directories. Cannot start traversal from there.", artistParent);
+                    }
+                }
+                else
+                {
+                     _logger.LogWarning(" -> Excluded artist path '{ArtistPath}' is at root or has no parent. Cannot automatically go up to start traversal.", validatedSeedArtistPath);
+                }
+            }
+            else
+            {
+                // Seed parent is NOT excluded, start there as usual, provided it exists.
+                if (browseDirLookup.ContainsKey(seedParentDir) || lockedDirs.Contains(seedParentDir))
+                {
+                     // visitedDirs already contains seedParentDir, no need to check again
+                     initialStackPushDir = seedParentDir;
+                     _logger.LogDebug("Starting traversal from seed parent directory: '{SeedParentDir}'", seedParentDir);
+                }
+                else
+                {
+                     // This case should be rare if the initial search found the file, but handle defensively.
+                     _logger.LogWarning("Seed parent directory '{SeedParentDir}' not found in browse results or locked directories for {User}, despite not being excluded. Cannot start traversal.", seedParentDir, username);
+                     return picks; // Cannot start if seed parent doesn't exist in browse data
+                }
+            }
+
+            // Push the determined starting directory (if any)
+            if (initialStackPushDir != null)
+            {
+                traversalStack.Push(initialStackPushDir);
+                // Ensure the actual starting point is marked visited *if it wasn't already*
+                // (It would be if it was the seedParentDir or an excluded path, but might not be if it's the artistParent)
+                if (visitedDirs.Add(initialStackPushDir))
+                {
+                     _logger.LogDebug(" -> Marked actual starting directory '{InitialDir}' as visited.", initialStackPushDir);
+                }
+                 _logger.LogDebug(" -> Pushed initial directory '{InitialDir}' onto stack.", initialStackPushDir);
+            }
+            else
+            {
+                 _logger.LogWarning("Could not determine a valid starting directory for traversal for user {User}. No picks possible.", username);
+                 return picks; // Cannot start traversal
+            }
+            // --- *** END Traversal Setup Modification *** ---
+
+
+            while (traversalStack.Count > 0 && picks.Count < maxPicks && !cancellationToken.IsCancellationRequested)
+            {
+                var currentDir = traversalStack.Pop();
+                _logger.LogDebug("Traversal: Popped '{CurrentDir}' from stack. Stack size: {StackSize}", currentDir, traversalStack.Count);
+
+                // Check if currentDir is within an excluded artist path (still needed for general traversal)
+                bool isExcluded = excludedArtistPaths.Any(excluded => currentDir.Equals(excluded, StringComparison.OrdinalIgnoreCase) || currentDir.StartsWith(excluded + SoulseekSeparator, StringComparison.OrdinalIgnoreCase));
+                if (isExcluded)
+                {
+                    _logger.LogDebug("Skipping processing of '{CurrentDir}' because it is within an excluded artist path.", currentDir);
+                    visitedDirs.Add(currentDir); // Ensure visited
+                    continue; // Skip file and child processing
+                }
+
+                // *** NOTE: The check for isSeedParentDirectory for skipping file processing is potentially less relevant now,
+                //     as if the seed parent was excluded, we started higher up. If it wasn't excluded,
+                //     processing its files might be desired if it's not the artist folder itself.
+                //     However, keeping it prevents picking siblings of the seed track in the exact same folder.
+                bool isSeedParentDirectory = currentDir.Equals(seedParentDir, StringComparison.Ordinal);
+                if (isSeedParentDirectory)
+                {
+                    _logger.LogDebug("Skipping file processing in '{CurrentDir}' because it is the seed track's parent directory.", currentDir);
+                }
+
+                // --- 1. Process Files (Only if NOT the seed parent dir, not already picked from, not locked, and not excluded) ---
+                bool pickedThisIteration = false;
+                if (!isSeedParentDirectory && !pickedFromFileInDir.Contains(currentDir) && !lockedDirs.Contains(currentDir)) // isExcluded check happened above
+                {
+                     if (browseDirLookup.TryGetValue(currentDir, out var currentDirEntry) && currentDirEntry.Files != null)
+                    {
+                        // ... (File processing logic remains the same) ...
+                        _logger.LogDebug("Processing files in '{CurrentDir}'. Found {FileCount} files in browse data.", currentDir, currentDirEntry.Files.Count);
+                        var filesInDir = currentDirEntry.Files
+                                            .Where(f => f != null && !string.IsNullOrEmpty(f.Filename)
+                                                        && IsAllowedExtension(f.Filename)
+                                                        && f.Size > 0 && f.Size <= fileSizeCapBytes)
+                                            .ToList();
+                        _logger.LogDebug(" -> {Count} files meet extension/size criteria in '{CurrentDir}'.", filesInDir.Count, currentDir);
+
+                        Shuffle(filesInDir);
+
+                        foreach (var file in filesInDir)
+                        {
+                            // ... (Path reconstruction, fuzzy matching logic remains the same) ...
+                            if (string.IsNullOrEmpty(file.Filename)) {
+                                _logger.LogWarning("Skipping file entry with null/empty filename in directory '{CurrentDir}'", currentDir);
+                                continue;
+                            }
+                            string potentialRelativeFileName = file.Filename;
+                            string reconstructedFullPath;
+                            if (potentialRelativeFileName.Contains(SoulseekSeparator)) { reconstructedFullPath = potentialRelativeFileName; }
+                            else { reconstructedFullPath = currentDir + SoulseekSeparator + potentialRelativeFileName; }
+
+                            var currentFileNameOnly = GetFileNameManual(reconstructedFullPath);
+                            var currentFileNameWithoutExtension = GetFileNameWithoutExtensionManual(currentFileNameOnly);
+                            var preprocessedCurrentFileName = PreprocessForFuzzyMatch(currentFileNameWithoutExtension);
+                            int fileSimilarity = (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedCurrentFileName))
+                                                    ? 0 : Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedCurrentFileName);
+
+                            _logger.LogDebug(" -> Checking file: '{FileName}' (Preprocessed: '{PreprocessedFile}') vs Seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Score}%",
+                                currentFileNameOnly, preprocessedCurrentFileName, preprocessedSeedFileName, fileSimilarity);
+
+                            if (fileSimilarity < SimilarityThreshold)
+                            {
+                                picks.Add(reconstructedFullPath);
+                                pickedFromFileInDir.Add(currentDir);
+                                pickedThisIteration = true;
+                                _logger.LogDebug("Picked file: {FileName} (Full Path: '{FullPath}', TokenSetRatio to seed '{SeedPreprocessed}': {Score}% < {Threshold}%)",
+                                    currentFileNameOnly, reconstructedFullPath, preprocessedSeedFileName, fileSimilarity, SimilarityThreshold);
+                                _logger.LogDebug(" -> Marked '{CurrentDir}' as having a file picked.", currentDir);
+
+                                // --- Gemini Artist Heuristic Trigger (For Picked Artist) ---
+                                if (!skipGeminiHeuristic && geminiCallsMade < maxGeminiCallsPerUser)
+                                {
+                                    _logger.LogInformation("Gemini Trigger: First pick from user {User}. Calling Gemini to identify artist in picked path: '{Path}' (Call {CallNum}/{MaxCalls})",
+                                        username, currentDir, geminiCallsMade + 1, maxGeminiCallsPerUser);
+
+                                    string? pickedArtistFolderName = await GetArtistFolderFromPathAsync(currentDir, cancellationToken);
+                                    geminiCallsMade++;
+
+                                    if (pickedArtistFolderName != null)
+                                    {
+                                        _logger.LogInformation("Gemini Response for picked path '{Path}': Identified '{ArtistFolder}' as potential artist folder.", currentDir, pickedArtistFolderName);
+                                        string? validatedPickedArtistPath = ValidateAndGetFullPathForArtistFolder(currentDir, pickedArtistFolderName);
+
+                                        if (validatedPickedArtistPath != null)
+                                        {
+                                            _logger.LogInformation("Gemini Action: Validated picked artist folder '{ArtistFolder}' found at path '{ArtistPath}'. Adding to excluded paths and redirecting traversal.",
+                                                pickedArtistFolderName, validatedPickedArtistPath);
+
+                                            excludedArtistPaths.Add(validatedPickedArtistPath);
+                                            visitedDirs.Add(validatedPickedArtistPath); // Ensure visited
+
+                                            string? artistParentPath = GetParentPathManual(validatedPickedArtistPath);
+
+                                            traversalStack.Clear();
+                                            _logger.LogDebug(" -> Cleared traversal stack.");
+
+                                            var newVisitedDirs = new HashSet<string>(StringComparer.Ordinal);
+                                            if (!string.IsNullOrEmpty(seedParentDir)) { newVisitedDirs.Add(seedParentDir); } // Keep original seed parent visited
+                                            newVisitedDirs.Add(currentDir); // Keep picked dir visited
+                                            foreach(var excluded in excludedArtistPaths) { newVisitedDirs.Add(excluded); } // Keep ALL excluded paths visited
+
+                                            visitedDirs = newVisitedDirs;
+                                            _logger.LogDebug(" -> Reset visitedDirs set, preserving essential paths and all {Count} excluded artist paths. New size: {NewCount}", excludedArtistPaths.Count, visitedDirs.Count);
+
+                                            if (!string.IsNullOrEmpty(artistParentPath) && (browseDirLookup.ContainsKey(artistParentPath) || lockedDirs.Contains(artistParentPath)))
+                                            {
+                                                if (!visitedDirs.Contains(artistParentPath))
+                                                {
+                                                    traversalStack.Push(artistParentPath);
+                                                    visitedDirs.Add(artistParentPath);
+                                                    _logger.LogInformation(" -> Pushing parent '{ParentPath}' onto stack to continue search above artist level. Added to visited.", artistParentPath);
+                                                }
+                                                else { _logger.LogDebug(" -> Parent '{ParentPath}' was already in the essential/excluded preserved set. Not pushing again.", artistParentPath); }
+                                            }
+                                            else { _logger.LogInformation(" -> Picked artist folder '{ArtistFolder}' has no valid parent or is at root. Traversal will stop unless stack had prior entries.", pickedArtistFolderName); }
+
+                                            goto EndFileProcessing; // Break file loop
+                                        }
+                                        else { _logger.LogWarning("Gemini Validation Failed: Folder '{ArtistFolder}' returned by Gemini not found as a component in picked path '{Path}'.", pickedArtistFolderName, currentDir); }
+                                    }
+                                    else { _logger.LogInformation("Gemini Response for picked path '{Path}': No specific artist folder identified or error occurred. Continuing standard traversal.", currentDir); }
+                                }
+                                // --- END Gemini Section for Picked Artist ---
+                                break; // Stop after one pick per directory
+                            }
+                            else { _logger.LogDebug(" -> Skipping file: {FileName} (TokenSetRatio: {Score}% >= {Threshold}%)", currentFileNameOnly, fileSimilarity, SimilarityThreshold); }
+                        } // End foreach file
+                        EndFileProcessing:;
+                        _logger.LogDebug(" -> Finished processing files in '{CurrentDir}'. Picked a file this iteration? {PickedStatus}", currentDir, pickedThisIteration);
+                    }
+                    else { _logger.LogTrace("Directory '{Dir}' not found in browse results or has null Files collection. Skipping file processing.", currentDir); }
+                } // --- End File Processing Check ---
+
+                if (picks.Count >= maxPicks || cancellationToken.IsCancellationRequested)
+                {
+                     _logger.LogDebug("Global pick limit ({Limit}) reached or cancellation requested. Stopping traversal.", maxPicks);
+                     break;
+                }
+
+                if (pickedThisIteration && !skipGeminiHeuristic && traversalStack.Count > 0 && !cancellationToken.IsCancellationRequested) {
+                     _logger.LogDebug("Gemini heuristic potentially modified stack after pick. Continuing to next iteration of while loop.");
+                     continue; // Skip child processing for currentDir, process the parent pushed by Gemini
+                }
+
+
+                // --- 2. Process Child Directories ---
+                _logger.LogDebug("Processing children of '{CurrentDir}'", currentDir);
+                var potentialChildren = browseDirLookup.Keys
+                    .Concat(lockedDirs)
+                    .Where(path => IsDirectChildManual(currentDir, path))
+                    .Distinct(StringComparer.Ordinal)
+                    .ToList();
+                 _logger.LogDebug(" -> Found {Count} potential child directories for '{CurrentDir}'.", potentialChildren.Count, currentDir);
+
+                Shuffle(potentialChildren);
+                var dissimilarChildrenToPush = new List<string>();
+
+                foreach (var childDir in potentialChildren)
+                {
+                    // Check visited AND excluded before processing
+                    if (visitedDirs.Contains(childDir)) { _logger.LogTrace("Child '{ChildDir}' already visited. Skipping.", childDir); continue; }
+                    bool isChildExcluded = excludedArtistPaths.Any(excluded => childDir.Equals(excluded, StringComparison.OrdinalIgnoreCase) || childDir.StartsWith(excluded + SoulseekSeparator, StringComparison.OrdinalIgnoreCase));
+                    if (isChildExcluded) { _logger.LogDebug("Child directory '{ChildDir}' is within an excluded artist path. Marking visited, skipping descent.", childDir); visitedDirs.Add(childDir); continue; }
+
+                    // ... (Similarity check logic remains the same) ...
+                    var childDirNameOnly = GetLastPathComponentManual(childDir);
+                    var preprocessedChildDirName = PreprocessForFuzzyMatch(childDirNameOnly);
+                    int similarity = (string.IsNullOrEmpty(preprocessedSeedFileName) || string.IsNullOrEmpty(preprocessedChildDirName))
+                                        ? 0 : Fuzz.TokenSetRatio(preprocessedSeedFileName, preprocessedChildDirName);
+
+                    _logger.LogTrace("Checking child dir '{ChildName}' (Preprocessed: '{PreprocessedChild}') against seed (Preprocessed: '{PreprocessedSeed}'). TokenSetRatio: {Similarity}%",
+                        childDirNameOnly, preprocessedChildDirName, preprocessedSeedFileName, similarity);
+
+                    if (similarity >= SimilarityThreshold)
+                    {
+                        _logger.LogDebug("Child directory '{ChildName}' (preprocessed:{preprocessedChildDirName}) is SIMILAR (TokenSetRatio: {Similarity}% >= {Threshold}%) to seed. Marking visited, skipping descent.",
+                             childDirNameOnly, preprocessedChildDirName, similarity, SimilarityThreshold);
+                        visitedDirs.Add(childDir);
+                    }
+                    else
+                    {
+                         _logger.LogTrace("Child directory '{ChildName}' is DISSIMILAR (TokenSetRatio: {Similarity}% < {Threshold}%). Adding to potential exploration list.", childDirNameOnly, similarity, SimilarityThreshold);
+                        dissimilarChildrenToPush.Add(childDir);
+                    }
+                } // --- End foreach childDir ---
+
+                // --- 3. Decide Traversal Action ---
+                var parentDir = GetParentPathManual(currentDir);
+                bool canGoUp = !string.IsNullOrEmpty(parentDir)
+                            && (browseDirLookup.ContainsKey(parentDir) || lockedDirs.Contains(parentDir));
+
+                if (dissimilarChildrenToPush.Any())
+                {
+                    _logger.LogDebug("Decision: Found {Count} dissimilar children for '{CurrentDir}'. Pushing them onto stack. Stack size before push: {StackSize}",
+                        dissimilarChildrenToPush.Count, currentDir, traversalStack.Count);
+                    foreach (var dissimilarChild in dissimilarChildrenToPush)
+                    {
+                        // Double-check not visited/excluded before pushing
+                        if (!visitedDirs.Contains(dissimilarChild) && !excludedArtistPaths.Any(excluded => dissimilarChild.Equals(excluded, StringComparison.OrdinalIgnoreCase) || dissimilarChild.StartsWith(excluded + SoulseekSeparator, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            traversalStack.Push(dissimilarChild);
+                            visitedDirs.Add(dissimilarChild);
+                             _logger.LogTrace(" -> Pushed dissimilar child: {ChildDir}", dissimilarChild);
+                        } else { _logger.LogTrace(" -> Skipping push of dissimilar child {ChildDir} as it became visited or is excluded.", dissimilarChild); }
+                    }
+                    _logger.LogDebug(" -> Stack size after pushing dissimilar children: {StackSize}", traversalStack.Count);
+                }
+                else // No dissimilar children to explore downwards
+                {
+                    _logger.LogDebug("Decision: No unvisited dissimilar children found for '{CurrentDir}'. Attempting to go up.", currentDir);
+                    if (canGoUp && parentDir != null)
+                    {
+                        // Check not visited/excluded before pushing parent
+                        bool isParentExcluded = excludedArtistPaths.Any(excluded => parentDir.Equals(excluded, StringComparison.OrdinalIgnoreCase) || parentDir.StartsWith(excluded + SoulseekSeparator, StringComparison.OrdinalIgnoreCase));
+                        if (!visitedDirs.Contains(parentDir) && !isParentExcluded)
+                        {
+                            _logger.LogDebug(" -> Can go up. Pushing parent '{ParentDir}' onto stack. Stack size: {StackSize}", parentDir, traversalStack.Count + 1);
+                            traversalStack.Push(parentDir);
+                            visitedDirs.Add(parentDir);
+                        } else { _logger.LogTrace(" -> Parent '{ParentDir}' already visited or is excluded, not pushing again.", parentDir); }
+                    }
+                    else { _logger.LogDebug(" -> Cannot go up from '{CurrentDir}'. No parent, parent not in browse/locked results, or parent already visited/excluded. Ending branch exploration.", currentDir); }
+                }
+            } // --- End while loop ---
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                 _logger.LogWarning("Crawl for {User} was cancelled during traversal.", username);
+            }
+
+            _logger.LogDebug("Traversal finished for {User}. Found {Count} picks (Quota: {Quota}). Gemini calls made: {GeminiCalls}/{MaxGeminiCalls}. Excluded artist paths: {ExcludedCount}",
+                username, picks.Count, maxPicks, geminiCallsMade, maxGeminiCallsPerUser, excludedArtistPaths.Count);
+            return picks;
         }
 
-        _logger.LogDebug("Traversal finished for {User}. Found {Count} picks (Quota: {Quota}). Gemini calls made: {GeminiCalls}", username, picks.Count, maxPicks, geminiCallsMade);
-        return picks;
-    }
+
+
+        // *** ADDED: Helper to validate Gemini response and get full path ***
+        /// <summary>
+        /// Validates if the artist folder name returned by Gemini exists as a component in the original path
+        /// and returns the full path to that component if found.
+        /// </summary>
+        /// <param name="originalPath">The full directory path sent to Gemini.</param>
+        /// <param name="artistFolderName">The folder name returned by Gemini.</param>
+        /// <returns>The full path ending with the validated artist folder, or null if not found/validated.</returns>
+        private string? ValidateAndGetFullPathForArtistFolder(string originalPath, string artistFolderName)
+        {
+            if (string.IsNullOrEmpty(originalPath) || string.IsNullOrEmpty(artistFolderName))
+            {
+                return null;
+            }
+
+            string[] pathComponents = originalPath.Split(SoulseekSeparator);
+            int artistIndex = -1;
+            for (int i = 0; i < pathComponents.Length; i++)
+            {
+                // Use OrdinalIgnoreCase for robustness against casing variations from Gemini or user shares
+                if (pathComponents[i].Equals(artistFolderName, StringComparison.OrdinalIgnoreCase))
+                {
+                    artistIndex = i;
+                    break;
+                }
+            }
+
+            if (artistIndex != -1)
+            {
+                // Reconstruct the path using the original components up to the found index
+                string validatedArtistFolderPath = string.Join(SoulseekSeparator.ToString(), pathComponents.Take(artistIndex + 1));
+                return validatedArtistFolderPath;
+            }
+
+            return null; // Folder name not found as a component
+        }
 
     // *** ADDED: Method to call Gemini API with retry logic ***
     /// <summary>
