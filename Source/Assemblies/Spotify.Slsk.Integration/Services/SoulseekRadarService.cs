@@ -41,7 +41,9 @@ namespace Spotify.Slsk.Integration.Services
         // *** ADDED: Constants for Gemini interaction ***
         private const string GeminiModelName = "gemini-2.0-flash"; // Use the appropriate model identifier
         private const int MaxGeminiRetries = 5; // For exponential backoff
-        private const int MaxGeminiTotalRetryDelaySeconds = 60;
+        private const int MaxGeminiTotalRetryDelaySeconds = 80;
+		// *** ADDED: Regex to extract retryDelay from Gemini error JSON ***
+		private static readonly Regex GeminiRetryDelayRegex = new Regex(@"\""retryDelay\"":\s*\""(\d+)s\""", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
 
         public SoulseekRadarService(
@@ -1135,7 +1137,8 @@ Now, analyze this path and provide only the required output:
     // *** ADDED: Method to call Gemini API with retry logic ***
     /// <summary>
     /// Calls the Gemini API to identify the artist folder in a given path.
-    /// Includes retry logic for rate limiting (429) errors using exponential backoff.
+    /// Includes retry logic for rate limiting (429) errors using exponential backoff,
+    /// prioritizing the 'retryDelay' field from the API response if available.
     /// </summary>
     /// <param name="directoryPath">The directory path to analyze.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
@@ -1150,7 +1153,7 @@ Now, analyze this path and provide only the required output:
         string prompt = string.Format(_geminiPromptTemplate, directoryPath);
         int attempt = 0;
         int totalDelayMs = 0;
-        int currentDelayMs = 1000; // Start with 1 second
+        int exponentialBackoffDelayMs = 1000; // Start with 1 second for fallback
 
         while (attempt <= MaxGeminiRetries && totalDelayMs < MaxGeminiTotalRetryDelaySeconds * 1000 && !cancellationToken.IsCancellationRequested)
         {
@@ -1190,32 +1193,72 @@ Now, analyze this path and provide only the required output:
             }
             catch (HttpRequestException httpEx)
             {
-                _logger.LogWarning(httpEx, "HTTP Error calling Gemini API (Attempt {Attempt}). Status Code: {StatusCode}. Path: {Path}", attempt, httpEx.StatusCode, directoryPath);
-
+                // *** CHANGE POINT: Check status code *before* deciding how to log ***
                 if (httpEx.StatusCode == HttpStatusCode.TooManyRequests) // 429 Rate Limit
                 {
+                    // *** Log WITHOUT the exception object for expected rate limits ***
+                    _logger.LogWarning("HTTP Error calling Gemini API (Attempt {Attempt}). Status Code: {StatusCode}. Path: {Path}. Message: {ErrorMessage}",
+                        attempt, httpEx.StatusCode, directoryPath, httpEx.Message); // Log message instead of full exception
+
                     if (attempt > MaxGeminiRetries || totalDelayMs >= MaxGeminiTotalRetryDelaySeconds * 1000)
                     {
                         _logger.LogError("Gemini rate limit exceeded and max retries ({MaxRetries}) or max delay ({MaxDelay}s) reached. Giving up for this path: {Path}", MaxGeminiRetries, MaxGeminiTotalRetryDelaySeconds, directoryPath);
-                        // Consider setting skipGeminiHeuristic = true at the caller level if needed
                         return null;
                     }
 
-                    _logger.LogInformation("Gemini rate limit hit. Waiting {DelayMs}ms before retry {RetryNum}/{MaxRetries}. Total delay so far: {TotalDelayMs}ms. Path: {Path}", currentDelayMs, attempt, MaxGeminiRetries, totalDelayMs, directoryPath);
+                    // --- Attempt to parse retryDelay from API response ---
+                    int delayMs = exponentialBackoffDelayMs; // Default to exponential backoff
+                    string delaySource = "exponential backoff";
+                    TimeSpan? delayFromApi = null;
+
                     try
                     {
-                        await Task.Delay(currentDelayMs, cancellationToken);
+                        // The exception message often contains the JSON body
+                        Match match = GeminiRetryDelayRegex.Match(httpEx.Message);
+                        if (match.Success && match.Groups.Count > 1 && int.TryParse(match.Groups[1].Value, out int seconds))
+                        {
+                            delayFromApi = TimeSpan.FromSeconds(seconds);
+                            // Use API delay + small buffer (e.g., 500ms) to avoid hitting limit exactly on reset
+                            delayMs = (int)delayFromApi.Value.TotalMilliseconds + 500;
+                            delaySource = "API suggestion";
+                             _logger.LogDebug("Parsed retryDelay: {Seconds}s from Gemini error response.", seconds);
+                        }
+                        else
+                        {
+                             _logger.LogDebug("Could not parse retryDelay from Gemini error response. Falling back to exponential backoff.");
+                        }
+                    }
+                    catch (Exception parseEx)
+                    {
+                        _logger.LogWarning(parseEx, "Error parsing retryDelay from Gemini error response message. Falling back to exponential backoff.");
+                    }
+                    // --- End parsing retryDelay ---
+
+
+                    // Ensure delay isn't excessively long, respecting our overall timeout somewhat
+                    // (though API delay should generally be trusted)
+                    delayMs = Math.Min(delayMs, 60000); // Cap individual delay at 60s regardless of source
+                    delayMs = Math.Max(delayMs, 500); // Ensure minimum delay
+
+                    // *** Log the wait message at Information level ***
+                    _logger.LogInformation("Gemini rate limit hit. Waiting {DelayMs}ms (using {DelaySource}) before retry {RetryNum}/{MaxRetries}. Total delay so far: {TotalDelayMs}ms. Path: {Path}",
+                        delayMs, delaySource, attempt, MaxGeminiRetries, totalDelayMs, directoryPath);
+
+                    try
+                    {
+                        await Task.Delay(delayMs, cancellationToken);
                     }
                     catch (OperationCanceledException) { throw; } // Propagate cancellation
 
-                    totalDelayMs += currentDelayMs;
-                    currentDelayMs = Math.Min(currentDelayMs * 2, 60000); // Exponential backoff up to 60s
+                    totalDelayMs += delayMs;
+                    // Still update exponential backoff value in case the *next* error doesn't provide a delay
+                    exponentialBackoffDelayMs = Math.Min(exponentialBackoffDelayMs * 2, 60000);
                 }
-                else
+                else // Handle other non-429 HTTP errors
                 {
-                    // Other HTTP error, don't retry immediately, treat as failure
-                    _logger.LogError("Non-retryable HTTP error from Gemini. Disabling heuristic for this user might be needed. Path: {Path}", directoryPath);
-                    return null;
+                    // *** Log WITH the exception object for unexpected HTTP errors ***
+                    _logger.LogError(httpEx, "Non-retryable HTTP error calling Gemini API (Attempt {Attempt}). Status Code: {StatusCode}. Path: {Path}", attempt, httpEx.StatusCode, directoryPath);
+                    return null; // Treat as failure
                 }
             }
             catch (OperationCanceledException)
@@ -1230,8 +1273,8 @@ Now, analyze this path and provide only the required output:
             }
             catch (Exception ex)
             {
+                // Log WITH exception for unexpected errors
                 _logger.LogError(ex, "Unexpected error calling Gemini API (Attempt {Attempt}). Path: {Path}", attempt, directoryPath);
-                // Could implement retry for transient non-HTTP errors here if desired, but for now, treat as failure.
                 return null;
             }
         } // End while loop
@@ -1242,7 +1285,7 @@ Now, analyze this path and provide only the required output:
         }
         else
         {
-             _logger.LogError("Gemini API call failed after {Attempts} attempts. Giving up for path: {Path}", attempt, directoryPath);
+             _logger.LogError("Gemini API call failed after {Attempts} attempts (due to retries/total delay). Giving up for path: {Path}", attempt, directoryPath);
         }
 
         return null; // Failed after retries or cancelled
