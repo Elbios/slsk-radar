@@ -579,7 +579,7 @@ Now, analyze this path and provide only the required output:
                     // *** Step 5 & 6: Call Spotify Service ***
                     _logger.LogInformation("STEP 5 & 6: Initiating Spotify Playlist Creation...");
                     // Use the original seedTrackQuery for the playlist title for consistency
-                    await _spotifyPlaylistService.CreatePlaylistFromHarvestedTracksAsync(seedTrackQuery, finalHarvestedTracks);
+                    await _spotifyPlaylistService.CreatePlaylistFromHarvestedTracksAsync(seedTrackQuery, finalHarvestedTracks, true);
                     _logger.LogInformation("Spotify Playlist Creation process finished.");
                 }
 
