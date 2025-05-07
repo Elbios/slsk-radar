@@ -9,7 +9,11 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Serilog;
 using Serilog.Extensions.Logging;
-using McMaster.Extensions.Hosting.CommandLine; // Required for RunCommandLineApplicationAsync
+using McMaster.Extensions.Hosting.CommandLine;
+using Spotify.Slsk.Integration.Services.SoulSeek; // For SoulseekService/Client
+using Spotify.Slsk.Integration.Services;       // For SoulseekRadarService
+using Spotify.Slsk.Integration.Services.Spotify; // *** ADDED: For SpotifyPlaylistService ***
+using Soulseek; // For SoulseekClient type
 
 namespace Spotify.Slsk.Integration.Cli
 {
@@ -18,78 +22,70 @@ namespace Spotify.Slsk.Integration.Cli
 
         public async static Task<int> Main(string[] args)
         {
-            // Ensure configuration path works correctly when published/run from different dirs
-            string basePath = AppContext.BaseDirectory; // Use AppContext.BaseDirectory for reliability
+            string basePath = AppContext.BaseDirectory;
             Console.WriteLine($"Base directory for configuration: {basePath}");
 
-
+            // Build initial configuration for Serilog setup
             IConfigurationRoot configuration = new ConfigurationBuilder()
-                .SetBasePath(basePath) // Use reliable base path
-                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true) // Make it non-optional
+                .SetBasePath(basePath)
+                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
                 .AddEnvironmentVariables()
                 .Build();
-
-            // Verify configuration loading
-            var radarSection = configuration.GetSection("SoulseekRadar");
-            if (!radarSection.Exists())
-            {
-                 Console.WriteLine("Warning: SoulseekRadar section not found in appsettings.json");
-            } else {
-                 Console.WriteLine($"SoulseekRadar:MaxUsers from config: {radarSection["MaxUsers"]}");
-            }
-
 
             Log.Logger = new LoggerConfiguration()
                .ReadFrom.Configuration(configuration)
                .Enrich.FromLogContext()
-               // .WriteTo.Console() // Console sink might be duplicated if also added via logging below
                .CreateLogger();
 
-             // Wrap host building in try-finally for proper logger disposal
             try
             {
-                Log.Information("Starting application host builder..."); // Initial log before host builds
+                Log.Information("Starting application host builder...");
 
-                IHostBuilder builder = Host.CreateDefaultBuilder(args) // Use CreateDefaultBuilder for standard setup
+                IHostBuilder builder = Host.CreateDefaultBuilder(args)
                     .ConfigureAppConfiguration((hostingContext, config) =>
                     {
-                        // Clear default providers if necessary, then add our config
                         config.Sources.Clear();
                         config.SetBasePath(basePath);
                         config.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true);
                         config.AddEnvironmentVariables();
-                        // Add command line args if needed: config.AddCommandLine(args);
                     })
-                    .ConfigureLogging((context, logging) => // Use ConfigureLogging for better integration
+                    .ConfigureLogging((context, logging) =>
                     {
-                        logging.ClearProviders(); // Clear other providers like default ConsoleLogger
-                        logging.AddSerilog(Log.Logger); // Add Serilog
+                        logging.ClearProviders();
+                        logging.AddSerilog(Log.Logger);
                     })
                     .ConfigureServices((hostContext, services) =>
                     {
                         // Add configuration instance for DI
-                        services.AddSingleton<IConfiguration>(configuration);
+                        services.AddSingleton<IConfiguration>(hostContext.Configuration); // Use hostContext's config
 
-                        // If we needed to register services:
-                        // services.AddSingleton<SoulseekClient>(sp => SoulseekService.GetClient()); // Example
-                        // services.AddTransient<SoulseekRadarService>(); // Example
+                        // Register SoulseekClient (as Singleton since it maintains connection state)
+                        // Consider managing its lifecycle more carefully if needed (e.g., dispose on shutdown)
+                        services.AddSingleton<SoulseekClient>(sp => SoulseekService.GetClient());
+
+                        // Register Services
+                        services.AddTransient<SpotifyPlaylistService>(); // *** ADDED: Register new Spotify service ***
+                        services.AddTransient<SoulseekRadarService>();   // Register Radar service (depends on SpotifyPlaylistService)
+
+                        // Register other services if they were intended to use DI
+                        // services.AddTransient<DownloadService>(); // Example if DownloadService used DI
                     });
 
 
                  Log.Information("Host built. Running command line application...");
+                 // Use the configured host to run the command line app
                  return await builder.RunCommandLineApplicationAsync<SpotseekCommand>(args);
 
             }
             catch (Exception ex)
             {
-                 // Log exception during host build or run
                  Log.Fatal(ex, "Application terminated unexpectedly during setup or execution.");
-                 Console.WriteLine($"Fatal Error: {ex.Message}"); // Also write to console directly
+                 Console.WriteLine($"Fatal Error: {ex.Message}");
                  return 1;
             }
             finally
             {
-                 Log.CloseAndFlush(); // Ensure logs are written before exit
+                 Log.CloseAndFlush();
             }
         }
     }

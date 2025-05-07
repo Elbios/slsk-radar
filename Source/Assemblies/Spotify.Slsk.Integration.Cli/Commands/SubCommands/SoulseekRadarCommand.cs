@@ -10,16 +10,18 @@ using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
-using Soulseek; // Added for SoulseekClient type
+using Soulseek;
 using System.ComponentModel.DataAnnotations;
+using Microsoft.Extensions.DependencyInjection; // *** ADDED: For GetRequiredService ***
 
 namespace Spotify.Slsk.Integration.Cli.Commands.SubCommands
 {
-    [Command("soulseek-radar", Description = "Recommends tracks based on users sharing a seed track on Soulseek.")]
+    [Command("soulseek-radar", Description = "Recommends tracks based on users sharing a seed track on Soulseek, creates Spotify playlist.")]
     class SoulseekRadarCommand : SpotSeekCommandBase
     {
-        private readonly IConfiguration _configuration;
-        private readonly ILoggerFactory _loggerFactory; // Added logger factory
+        // Dependencies will be injected by the host
+        private readonly ILogger<SoulseekRadarCommand> _radarCmdLogger; // Specific logger for this command
+        private readonly IServiceProvider _serviceProvider; // To resolve services
 
         [Argument(0, Name = "SeedTrack", Description = "The seed track to start discovery (e.g., 'Artist - Title' or Spotify URI)")]
         [Required]
@@ -31,92 +33,89 @@ namespace Spotify.Slsk.Integration.Cli.Commands.SubCommands
         [Option(CommandOptionType.SingleValue, ShortName = "p", LongName = "sspassword", Description = "Soulseek login password", ValueName = "login password", ShowInHelpText = true)]
         public string? SSPassword { get; set; }
 
-        // Inject ILogger, IConsole, IConfiguration, and ILoggerFactory
-        public SoulseekRadarCommand(ILogger<SoulseekRadarCommand> logger, IConsole console, IConfiguration configuration, ILoggerFactory loggerFactory)
+        // Inject ILogger, IConsole, and IServiceProvider
+        public SoulseekRadarCommand(ILogger<SoulseekRadarCommand> logger, IConsole console, IServiceProvider serviceProvider)
         {
-            _logger = logger; // Base class logger (ILogger<SoulseekRadarCommand>)
+            // Assign base class logger and console if needed, or use the specific one
+            _logger = logger; // Assign to base class logger
+            _radarCmdLogger = logger; // Keep specific logger if needed for command-specific logs
             _console = console;
-            _configuration = configuration;
-            _loggerFactory = loggerFactory; // Store the factory
+            _serviceProvider = serviceProvider; // Store service provider
         }
 
         protected override async Task<int> OnExecute(CommandLineApplication app)
         {
-            _logger.LogInformation("Executing Soulseek-Radar command...");
+            _radarCmdLogger.LogInformation("Executing Soulseek-Radar command...");
 
-            LoadCredentials();
+            LoadCredentials(); // Load credentials using base class logic + prompting
 
             if (string.IsNullOrEmpty(SSUsername) || string.IsNullOrEmpty(SSPassword))
             {
-                 _logger.LogError("Soulseek username and password are required.");
+                 _radarCmdLogger.LogError("Soulseek username and password are required.");
                  return 1;
             }
+            if (string.IsNullOrWhiteSpace(SeedTrack))
+            {
+                _radarCmdLogger.LogError("Seed track cannot be empty.");
+                return 1;
+            }
+
 
             try
             {
-                if (string.IsNullOrWhiteSpace(SeedTrack))
-                {
-                    _logger.LogError("Seed track cannot be empty.");
-                    return 1;
-                }
+                // Resolve the SoulseekRadarService from the DI container
+                // This ensures it gets its dependencies (logger, config, soulseek client, spotify service) injected correctly
+                var radarService = _serviceProvider.GetRequiredService<SoulseekRadarService>();
 
-                string seedQuery = SeedTrack;
-                _logger.LogDebug("Using seed query: {Query}", seedQuery);
+                string seedQuery = SeedTrack; // Use the provided argument directly
+                _radarCmdLogger.LogDebug("Using seed query: {Query}", seedQuery);
 
-                var soulseekClient = SoulseekService.GetClient(); // Existing static method
-
-                // Create the specific logger type using the factory
-                var radarServiceLogger = _loggerFactory.CreateLogger<SoulseekRadarService>();
-
-                // Instantiate the service with the correct logger
-                var radarService = new SoulseekRadarService(
-                    radarServiceLogger, // Pass the correctly created logger
-                    soulseekClient,
-                    _configuration
-                );
-
-                _logger.LogInformation("Attempting to start Soulseek-Radar discovery..."); // Added log
+                _radarCmdLogger.LogInformation("Attempting to start Soulseek-Radar discovery and Spotify playlist creation...");
                 await radarService.DiscoverTracksAsync(seedQuery, SSUsername, SSPassword);
 
-                _logger.LogInformation("Soulseek-Radar command finished execution.");
+                _radarCmdLogger.LogInformation("Soulseek-Radar command finished execution successfully.");
                 return 0;
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "An error occurred during the soulseek-radar command execution.");
-                // OnException(ex); // Base class handler might be less informative here
-                _console.Error.WriteLine($"ERROR: {ex.Message}"); // Direct error output
-                _logger.LogDebug(ex.StackTrace); // Log stack trace for debugging
+                _radarCmdLogger.LogError(ex, "An error occurred during the soulseek-radar command execution.");
+                _console.Error.WriteLine($"ERROR: {ex.Message}");
+                // Consider logging stack trace only at Debug level for production
+                _radarCmdLogger.LogDebug(ex.StackTrace);
                 return 1;
             }
         }
 
+        // LoadCredentials remains the same as provided in the original codebase
         private void LoadCredentials()
         {
             try
             {
-                if (!string.IsNullOrEmpty(Profile) && System.IO.File.Exists($"{ProfileFolder}{Profile}")) // Check file exists
+                // Use base class ProfileFolder and Profile properties
+                string profilePath = Path.Combine(ProfileFolder, Profile);
+                if (!string.IsNullOrEmpty(Profile) && System.IO.File.Exists(profilePath))
                 {
                     // Accessing UserProfile property triggers loading and decryption
-                    if (UserProfile != null)
+                    if (UserProfile != null) // UserProfile is defined in SpotSeekCommandBase
                     {
                          SSUsername ??= UserProfile.Username;
-                         SSPassword ??= UserProfile.Password;
-                         _logger.LogDebug("Loaded credentials from profile '{ProfileName}'", Profile);
+                         SSPassword ??= UserProfile.Password; // Assumes UserProfile.Password is decrypted by the getter
+                         _radarCmdLogger.LogDebug("Loaded credentials from profile '{ProfileName}'", Profile);
                     } else {
-                         _logger.LogWarning("Profile file '{ProfileName}' loaded but failed to deserialize or decrypt.", Profile);
+                         _radarCmdLogger.LogWarning("Profile file '{ProfileName}' loaded but failed to deserialize or decrypt.", Profile);
                     }
                 }
                 else if (!string.IsNullOrEmpty(Profile))
                 {
-                     _logger.LogDebug("Profile file not found for '{ProfileName}'. Will prompt if needed.", Profile);
+                     _radarCmdLogger.LogDebug("Profile file not found: '{ProfilePath}'. Will prompt if needed.", profilePath);
                 }
             }
             catch (Exception ex)
             {
-                 _logger.LogWarning(ex, "Could not load profile '{ProfileName}'. Will prompt if needed.", Profile);
+                 _radarCmdLogger.LogWarning(ex, "Could not load profile '{ProfileName}'. Will prompt if needed.", Profile);
             }
 
+            // Prompt if still missing
             if (string.IsNullOrEmpty(SSUsername))
             {
                 SSUsername = Prompt.GetString("Soulseek user name:", SSUsername);
@@ -124,8 +123,9 @@ namespace Spotify.Slsk.Integration.Cli.Commands.SubCommands
 
             if (string.IsNullOrEmpty(SSPassword))
             {
+                // Use base class SecureStringToString and Prompt
                 SSPassword = SecureStringToString(Prompt.GetPasswordAsSecureString("Soulseek password:"));
-                // Consider saving back to profile here if desired
+                // Optional: Consider saving back to profile here if desired and implemented
             }
         }
     }
