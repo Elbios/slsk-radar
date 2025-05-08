@@ -5,6 +5,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>spotseek</AssemblyName>
     <InformationalVersion>1.5.5</InformationalVersion>
+    <PublishAot>true</PublishAot>
+    <TrimMode>link</TrimMode>
+    <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
+    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
+    <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,6 +25,10 @@
   <ItemGroup>
     <ProjectReference Include="..\Spotify.Slsk.Integration\Spotify.Slsk.Integration.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <Using Include="System.Text.Json.Serialization" />
+  </ItemGroup>
+
 
   <ItemGroup>
     <Content Include="Properties\launchSettings.json">

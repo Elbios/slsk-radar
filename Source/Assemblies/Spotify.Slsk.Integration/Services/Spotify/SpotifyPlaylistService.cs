@@ -16,6 +16,10 @@ using System.Text.Json.Serialization;  // For JsonPropertyName attribute
 
 namespace Spotify.Slsk.Integration.Services.Spotify
 {
+	[JsonSerializable(typeof(List<SpotifyPlaylistService.SpotifyTrackJsonOutput>))]
+	internal partial class MyJsonContext : JsonSerializerContext
+	{
+	}
     public class SpotifyPlaylistService
     {
         private readonly ILogger<SpotifyPlaylistService> _logger;
@@ -78,11 +82,11 @@ namespace Spotify.Slsk.Integration.Services.Spotify
             public string Title { get; set; }
             public string SpotifyUrl { get; set; }
         }
-
+		
         /// <summary>
         /// Helper class for JSON serialization to match Go struct.
         /// </summary>
-        private class SpotifyTrackJsonOutput
+        public class SpotifyTrackJsonOutput
         {
             [JsonPropertyName("artist")]
             public string Artist { get; set; }
@@ -92,6 +96,7 @@ namespace Spotify.Slsk.Integration.Services.Spotify
             public string Link { get; set; }
         }
 
+		
         /// <summary>
         /// Build (or overwrite) a playlist from harvested Soulseek matches,
         /// or output track links to a JSON file if outputJsonPath is provided.
@@ -227,7 +232,12 @@ namespace Spotify.Slsk.Integration.Services.Spotify
                         })
                         .ToList();
                     
-                    string jsonContent = JsonSerializer.Serialize(tracksForJson, new JsonSerializerOptions { WriteIndented = true });
+                    //string jsonContent = JsonSerializer.Serialize(tracksForJson, new JsonSerializerOptions { WriteIndented = true });
+					string jsonContent = JsonSerializer.Serialize(
+						tracksForJson, 
+						MyJsonContext.Default.ListSpotifyTrackJsonOutput
+					);
+
 
                     string? directory = Path.GetDirectoryName(outputJsonPath);
                     if (!string.IsNullOrEmpty(directory))
