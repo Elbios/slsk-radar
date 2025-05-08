@@ -5,11 +5,11 @@
     <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>spotseek</AssemblyName>
     <InformationalVersion>1.5.5</InformationalVersion>
-    <PublishAot>true</PublishAot>
-    <TrimMode>link</TrimMode>
-    <EnableUnsafeBinaryFormatterSerialization>false</EnableUnsafeBinaryFormatterSerialization>
-    <EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <PublishAot>false</PublishAot>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
   <ItemGroup>
