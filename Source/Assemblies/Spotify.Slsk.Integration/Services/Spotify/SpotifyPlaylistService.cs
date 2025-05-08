@@ -11,7 +11,8 @@ using System.Linq;
 using System.Net;                      // HttpStatusCode
 using System.Threading;
 using System.Threading.Tasks;
-using System.Text.RegularExpressions;
+using System.Text.Json;                // For JSON serialization
+using System.Text.Json.Serialization;  // For JsonPropertyName attribute
 
 namespace Spotify.Slsk.Integration.Services.Spotify
 {
@@ -22,9 +23,7 @@ namespace Spotify.Slsk.Integration.Services.Spotify
         private readonly string? _clientId;
         private readonly string? _clientSecret;
         private readonly string? _refreshToken;
-		// Helper record to store track details for file output
-		private record TrackLinkInfo(string Artist, string Title, string SpotifyUrl);
-		
+
         public SpotifyPlaylistService(ILogger<SpotifyPlaylistService> logger)
         {
             _logger = logger;
@@ -69,8 +68,9 @@ namespace Spotify.Slsk.Integration.Services.Spotify
                 _logger.LogError(ex, "Unrecoverable error while initialising Spotify client.");
             }
         }
+
         /// <summary>
-        /// Helper class to store details for file output.
+        /// Helper class to store track details for file output.
         /// </summary>
         private class FoundTrackDetail
         {
@@ -80,27 +80,26 @@ namespace Spotify.Slsk.Integration.Services.Spotify
         }
 
         /// <summary>
-        /// Normalizes a string to be a valid filename by replacing invalid characters.
+        /// Helper class for JSON serialization to match Go struct.
         /// </summary>
-        private string NormalizeFileName(string name)
+        private class SpotifyTrackJsonOutput
         {
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                name = "Untitled";
-            }
-            string invalidChars = Regex.Escape(new string(Path.GetInvalidFileNameChars()));
-            string invalidRegStr = string.Format(@"([{0}]*\.+$)|([{0}]+)", invalidChars);
-            string normalizedName = Regex.Replace(name, invalidRegStr, "_");
-            return normalizedName.Length > 100 ? normalizedName.Substring(0, 100) : normalizedName; // Optional: Truncate long names
+            [JsonPropertyName("artist")]
+            public string Artist { get; set; }
+            [JsonPropertyName("title")]
+            public string Title { get; set; }
+            [JsonPropertyName("link")]
+            public string Link { get; set; }
         }
+
         /// <summary>
         /// Build (or overwrite) a playlist from harvested Soulseek matches,
-        /// or output track links to a file if skipCreationOutputLinksOnly is true.
+        /// or output track links to a JSON file if outputJsonPath is provided.
         /// </summary>
         public async Task CreatePlaylistFromHarvestedTracksAsync(
             string seedTrackTitle,
             List<HarvestedFileInfo> harvestedTracks,
-            bool skipCreationOutputLinksOnly = false)
+            string? outputJsonPath = null) // Changed parameter
         {
             if (_spotify == null)
             {
@@ -113,12 +112,12 @@ namespace Spotify.Slsk.Integration.Services.Spotify
                 return;
             }
 
-            _logger.LogInformation(skipCreationOutputLinksOnly
-                ? "↻ Searching Spotify matches for seed “{Seed}” to output to file..."
-                : "↻ Building playlist for seed “{Seed}”…", seedTrackTitle);
+            _logger.LogInformation(outputJsonPath != null // Changed condition
+                ? "↻ Searching Spotify matches for seed “{Seed}” to output to JSON file: {JsonPath}"
+                : "↻ Building playlist for seed “{Seed}”…", seedTrackTitle, outputJsonPath ?? "N/A");
 
             var foundTrackUris = new ConcurrentBag<string>(); // For playlist URIs
-            var foundTracksForFile = skipCreationOutputLinksOnly ? new ConcurrentBag<FoundTrackDetail>() : null; // For file output
+            var foundTracksForFile = outputJsonPath != null ? new ConcurrentBag<FoundTrackDetail>() : null; // For file output
             var notFound = new ConcurrentBag<HarvestedFileInfo>(); // For tracks not found or unusable
             var gate = new SemaphoreSlim(5, 5); // Limit concurrent Spotify API calls
 
@@ -164,7 +163,7 @@ namespace Spotify.Slsk.Integration.Services.Spotify
                     var bestMatch = sr.Tracks?.Items?.FirstOrDefault(); // Simplistic best match, could be improved
                     if (bestMatch != null)
                     {
-                        if (skipCreationOutputLinksOnly)
+                        if (outputJsonPath != null) // Changed condition
                         {
                             string spotifyLink = null;
                             bestMatch.ExternalUrls?.TryGetValue("spotify", out spotifyLink);
@@ -180,7 +179,7 @@ namespace Spotify.Slsk.Integration.Services.Spotify
                             }
                             else
                             {
-                                _logger.LogWarning("Track “{Artist} - {Title}” found on Spotify (URI: {Uri}) but has no external URL. Skipping for file output.", track.Artist, track.Title, bestMatch.Uri);
+                                _logger.LogWarning("Track “{Artist} - {Title}” found on Spotify (URI: {Uri}) but has no external URL. Skipping for JSON output.", track.Artist, track.Title, bestMatch.Uri);
                                 notFound.Add(track); // Track is unusable for file output
                             }
                         }
@@ -207,42 +206,46 @@ namespace Spotify.Slsk.Integration.Services.Spotify
 
             await Task.WhenAll(searchJobs);
 
-            if (skipCreationOutputLinksOnly)
+            if (outputJsonPath != null) // Changed condition
             {
                 if (foundTracksForFile == null || foundTracksForFile.IsEmpty)
                 {
-                    _logger.LogWarning("No Spotify tracks with URLs found for seed “{Seed}”. Output file skipped. {NotFoundCount} tracks could not be matched or lacked a URL.", seedTrackTitle, notFound.Count);
+                    _logger.LogWarning("No Spotify tracks with URLs found for seed “{Seed}”. JSON output file skipped. {NotFoundCount} tracks could not be matched or lacked a URL.", seedTrackTitle, notFound.Count);
                     return;
                 }
 
                 try
                 {
-                    string timestamp = DateTime.UtcNow.ToString("yyyyMMddHHmmss");
-                    string normalizedSeedTitle = NormalizeFileName(seedTrackTitle);
-                    string fileName = $"{normalizedSeedTitle}_{timestamp}.txt";
-                    
-                    // Consider making the output directory configurable
-                    string outputDirectory = Path.Combine(Directory.GetCurrentDirectory(), "SpotifyTracklists");
-                    Directory.CreateDirectory(outputDirectory); // Ensure directory exists
-                    string filePath = Path.Combine(outputDirectory, fileName);
-
-                    var lines = foundTracksForFile
-                        .OrderBy(f => f.Artist) // Optional: order by artist, then title
+                    var tracksForJson = foundTracksForFile
+                        .OrderBy(f => f.Artist)
                         .ThenBy(f => f.Title)
-                        .Select(f => $"{f.Artist},{f.Title},{f.SpotifyUrl}")
+                        .Select(f => new SpotifyTrackJsonOutput
+                        {
+                            Artist = f.Artist,
+                            Title = f.Title,
+                            Link = f.SpotifyUrl
+                        })
                         .ToList();
                     
-                    await File.WriteAllLinesAsync(filePath, lines);
+                    string jsonContent = JsonSerializer.Serialize(tracksForJson, new JsonSerializerOptions { WriteIndented = true });
+
+                    string? directory = Path.GetDirectoryName(outputJsonPath);
+                    if (!string.IsNullOrEmpty(directory))
+                    {
+                        Directory.CreateDirectory(directory); // Ensure directory exists
+                    }
+                    
+                    await File.WriteAllTextAsync(outputJsonPath, jsonContent);
 
                     _logger.LogInformation(
-                        "Output file ready: {FilePath}. {WrittenCount} tracks written. {SkippedCount} tracks could not be matched or lacked a Spotify URL.",
-                        filePath,
-                        foundTracksForFile.Count,
+                        "JSON output file ready: {JsonFilePath}. {WrittenCount} tracks written. {SkippedCount} tracks could not be matched or lacked a Spotify URL.",
+                        outputJsonPath,
+                        tracksForJson.Count,
                         notFound.Count);
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Unexpected error during file output generation for seed “{Seed}”.", seedTrackTitle);
+                    _logger.LogError(ex, "Unexpected error during JSON file output generation for seed “{Seed}” to path {JsonPath}.", seedTrackTitle, outputJsonPath);
                 }
             }
             else // Playlist creation logic
@@ -256,23 +259,14 @@ namespace Spotify.Slsk.Integration.Services.Spotify
                 try
                 {
                     var me = await _spotify.UserProfile.Current();
-                    var playlistId = await GetOrCreatePlaylistIdAsync(me.Id, seedTrackTitle); // Assuming this method exists
+                    var playlistId = await GetOrCreatePlaylistIdAsync(me.Id, seedTrackTitle);
                     
-                    // Spotify API limits adding items to a playlist to 100 per request.
-                    // Chunk the URIs if necessary.
                     var trackUrisList = foundTrackUris.ToList();
-                    const int maxItemsPerRequest = 100;
-                    
-                    // For replacing content, typically you clear it first then add.
-                    // The ReplacePlaylistContentAsync should handle this logic.
-                    // If it takes all items at once and handles chunking, great.
-                    // Otherwise, you might need to call _spotify.Playlists.ClearItems(playlistId)
-                    // and then loop _spotify.Playlists.AddItems(playlistId, new PlaylistAddItemsRequest(chunk))
-
-                    await ReplacePlaylistContentAsync(playlistId, trackUrisList); // Assuming this method exists and handles chunking if needed
+                    await ReplacePlaylistContentAsync(playlistId, trackUrisList);
 
                     _logger.LogInformation(
                         "Playlist for seed “{Seed}” ready: {Ok} tracks processed for playlist, {Miss} original tracks not found/matched.",
+                        seedTrackTitle, // Added seedTrackTitle to log as it was missing
                         foundTrackUris.Count,
                         notFound.Count);
                 }
@@ -292,6 +286,8 @@ namespace Spotify.Slsk.Integration.Services.Spotify
 
         private async Task<string> GetOrCreatePlaylistIdAsync(string userId, string seed)
         {
+            // Playlist name format updated for clarity and to avoid potential filename issues if used directly.
+            // Using the seed directly as per original logic.
             var name = $"Soulseek‑Radar · {seed} · {DateTime.Now:yyyy‑MM‑dd}";
 
             var first   = await _spotify.Playlists.CurrentUsers();
@@ -319,10 +315,23 @@ namespace Spotify.Slsk.Integration.Services.Spotify
             var offset      = 0;
             var first       = true;
 
+            // Clear the playlist first if there are items to add.
+            // If uris is empty, clearing is not strictly necessary but ReplaceItems with empty list also works.
+            if (uris.Any())
+            {
+                 // ReplaceItems will replace all items, so effectively clears and adds the first batch.
+            }
+            else // No URIs to add, ensure playlist is empty.
+            {
+                await _spotify.Playlists.ReplaceItems(id, new PlaylistReplaceItemsRequest(new List<string>()));
+                return; // No more items to process
+            }
+
+
             while (offset < uris.Count)
             {
                 var slice = uris.Skip(offset).Take(batch).ToList();
-                if (slice.Count == 0) break;
+                if (slice.Count == 0) break; // Should not happen if uris.Any() was true and offset logic is correct
 
                 if (first)
                 {

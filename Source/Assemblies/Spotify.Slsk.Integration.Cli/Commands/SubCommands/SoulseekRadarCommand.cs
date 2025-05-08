@@ -33,6 +33,9 @@ namespace Spotify.Slsk.Integration.Cli.Commands.SubCommands
         [Option(CommandOptionType.SingleValue, ShortName = "p", LongName = "sspassword", Description = "Soulseek login password", ValueName = "login password", ShowInHelpText = true)]
         public string? SSPassword { get; set; }
 
+        [Option(CommandOptionType.SingleValue, ShortName = "o", LongName = "output-json", Description = "Optional path to a JSON file to output results.", ValueName = "FILEPATH", ShowInHelpText = true)]
+        public string? OutputJsonPath { get; set; }
+
         // Inject ILogger, IConsole, and IServiceProvider
         public SoulseekRadarCommand(ILogger<SoulseekRadarCommand> logger, IConsole console, IServiceProvider serviceProvider)
         {
@@ -69,9 +72,15 @@ namespace Spotify.Slsk.Integration.Cli.Commands.SubCommands
 
                 string seedQuery = SeedTrack; // Use the provided argument directly
                 _radarCmdLogger.LogDebug("Using seed query: {Query}", seedQuery);
+                if (!string.IsNullOrEmpty(OutputJsonPath))
+                {
+                    _radarCmdLogger.LogInformation("Outputting results to JSON file: {FilePath}", OutputJsonPath);
+                }
+
 
                 _radarCmdLogger.LogInformation("Attempting to start Soulseek-Radar discovery and Spotify playlist creation...");
-                await radarService.DiscoverTracksAsync(seedQuery, SSUsername, SSPassword);
+                // Pass the OutputJsonPath to the service method
+                await radarService.DiscoverTracksAsync(seedQuery, SSUsername, SSPassword, OutputJsonPath);
 
                 _radarCmdLogger.LogInformation("Soulseek-Radar command finished execution successfully.");
                 return 0;
